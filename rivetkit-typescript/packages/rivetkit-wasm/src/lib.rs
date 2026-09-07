@@ -243,6 +243,7 @@ impl From<WasmActorConfig> for ActorConfigInput {
 			has_state: config.has_state,
 			can_hibernate_websocket: config.can_hibernate_websocket,
 			state_save_interval_ms: config.state_save_interval_ms,
+			transactional: None,
 			create_vars_timeout_ms: config.create_vars_timeout_ms,
 			create_conn_state_timeout_ms: config.create_conn_state_timeout_ms,
 			on_before_connect_timeout_ms: config.on_before_connect_timeout_ms,

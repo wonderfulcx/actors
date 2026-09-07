@@ -92,7 +92,9 @@ instance per active actor. It must:
 
 Compiled component machine code may be shared. Stores, linear memory, the
 StarlingMonkey/SpiderMonkey heap, and resident component instances may not be
-shared between active actors.
+shared between active actors. See
+[Wonderful Wasmtime actor runtime](wonderful-wasmtime-runtime.md) for the concrete
+adapter sequence and capability boundary.
 
 ## Future read-only queries
 

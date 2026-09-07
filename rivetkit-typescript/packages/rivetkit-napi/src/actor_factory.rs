@@ -1000,6 +1000,7 @@ impl From<JsActorConfig> for ActorConfigInput {
 			has_state: value.has_state,
 			can_hibernate_websocket: value.can_hibernate_websocket,
 			state_save_interval_ms: value.state_save_interval_ms,
+			transactional: None,
 			create_vars_timeout_ms: value.create_vars_timeout_ms,
 			create_conn_state_timeout_ms: value.create_conn_state_timeout_ms,
 			on_before_connect_timeout_ms: value.on_before_connect_timeout_ms,

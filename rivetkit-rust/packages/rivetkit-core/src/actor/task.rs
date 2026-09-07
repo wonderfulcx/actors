@@ -417,6 +417,7 @@ impl ActorTask {
 		let (actor_event_tx, actor_event_rx) = mpsc::unbounded_channel();
 		let (inspector_overlay_tx, _) = broadcast::channel(INSPECTOR_OVERLAY_CHANNEL_CAPACITY);
 		let inspector_attach_count = Arc::new(AtomicU32::new(0));
+		ctx.configure_generation(generation);
 		ctx.configure_inspector_runtime(
 			Arc::clone(&inspector_attach_count),
 			inspector_overlay_tx.clone(),

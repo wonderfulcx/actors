@@ -173,6 +173,7 @@ pub(crate) struct ActorContextInner {
 	pub(super) metrics: ActorMetrics,
 	diagnostics: ActorDiagnostics,
 	actor_id: String,
+	generation: RwLock<Option<u32>>,
 	name: String,
 	key: ActorKey,
 	region: String,
@@ -276,7 +277,7 @@ impl ActorContext {
 		name: String,
 		key: ActorKey,
 		region: String,
-		_generation: Option<u32>,
+		generation: Option<u32>,
 		_envoy_key: String,
 		config: ActorConfig,
 		legacy_kv: LegacyActorKv,
@@ -388,6 +389,7 @@ impl ActorContext {
 			metrics,
 			diagnostics,
 			actor_id,
+			generation: RwLock::new(generation),
 			name,
 			key,
 			region,
@@ -756,6 +758,15 @@ impl ActorContext {
 
 	pub fn actor_id(&self) -> &str {
 		&self.0.actor_id
+	}
+
+	/// Returns the active engine generation after this context is attached to an actor task.
+	pub fn generation(&self) -> Option<u32> {
+		*self.0.generation.read()
+	}
+
+	pub(crate) fn configure_generation(&self, generation: u32) {
+		*self.0.generation.write() = Some(generation);
 	}
 
 	pub fn name(&self) -> &str {

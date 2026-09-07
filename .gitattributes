@@ -11,6 +11,7 @@ container-runner/examples/unity-demo/Packages/** -text
 *.jpg binary
 *.jpeg binary
 *.gif binary
+*.wasm binary
 *.tar binary
 *.tar.gz binary
 *.tgz binary

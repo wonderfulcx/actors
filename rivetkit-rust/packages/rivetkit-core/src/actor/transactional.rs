@@ -213,11 +213,20 @@ impl TransactionalOperation {
 		error: &anyhow::Error,
 		completed_at: i64,
 	) -> Result<TransactionalOperationFailure> {
+		let failure = TransactionalOperationFailure::from_error(error);
+		self.fail_with(failure, completed_at).await
+	}
+
+	/// Rolls back guest changes and durably records an adapter-sanitized failure.
+	pub async fn fail_with(
+		self,
+		failure: TransactionalOperationFailure,
+		completed_at: i64,
+	) -> Result<TransactionalOperationFailure> {
 		self.transaction
 			.rollback()
 			.await
 			.context("roll back failed transactional operation")?;
-		let failure = TransactionalOperationFailure::from_error(error);
 		persist_terminal_failure(
 			&self.ctx,
 			&self.request.operation_id,
