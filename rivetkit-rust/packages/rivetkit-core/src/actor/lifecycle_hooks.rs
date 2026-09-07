@@ -10,6 +10,12 @@ pub struct Reply<T> {
 }
 
 impl<T> Reply<T> {
+	pub async fn closed(&mut self) {
+		if let Some(tx) = self.tx.as_mut() {
+			tx.closed().await;
+		}
+	}
+
 	pub fn send(mut self, result: Result<T>) {
 		if let Some(tx) = self.tx.take() {
 			let _ = tx.send(result);

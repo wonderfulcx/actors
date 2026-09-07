@@ -26,6 +26,11 @@ Two user-facing primitives in TypeScript. Both accept a `Promise`, never a closu
 
 Kept separate for debug visibility. Grace deadline warn logs report each counter independently so diagnostics distinguish user keep-awake sites from framework-owned keep-awake sites (schedule alarms, queue receives).
 
+A failed transactional schedule-alarm synchronization installs one registered retry
+task holding a scoped keep-awake region. It releases the region only after envoy
+acknowledges alarm admission and the acknowledged deadline is persisted; destroy's
+shutdown deadline can still abort the registered retry.
+
 ## Sleep readiness predicates
 
 Two predicates govern the sleep state machine. Both live on `ActorContext` / `SleepState`.

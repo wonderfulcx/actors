@@ -123,6 +123,7 @@ pub(crate) struct ActorContextInner {
 	pub(super) schedule_alarm_push_epoch: AtomicU64,
 	pub(super) schedule_alarm_dispatch_enabled: AtomicBool,
 	pub(super) schedule_dirty_since_push: AtomicBool,
+	pub(super) schedule_alarm_retry_active: AtomicBool,
 	pub(super) schedule_mutation_lock: AsyncMutex<()>,
 	pub(super) schedule_running: SccHashSet<String>,
 	pub(super) schedule_history_insert_count: AtomicUsize,
@@ -347,6 +348,7 @@ impl ActorContext {
 			// A fresh actor context has no in-process record of a successful
 			// envoy alarm push yet, so the first sync must always push.
 			schedule_dirty_since_push: AtomicBool::new(true),
+			schedule_alarm_retry_active: AtomicBool::new(false),
 			schedule_mutation_lock: AsyncMutex::new(()),
 			schedule_running: SccHashSet::new(),
 			schedule_history_insert_count: AtomicUsize::new(0),

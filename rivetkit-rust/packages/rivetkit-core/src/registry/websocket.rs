@@ -731,7 +731,9 @@ fn configure_actor_connect_connection(
 			Ok(()) => Ok(()),
 			Err(ActorConnectSendError::OutgoingTooLong) => {
 				event_sender.close(Some(1011), Some("message.outgoing_too_long".to_owned()));
-				Ok(())
+				Err(anyhow::anyhow!(
+					"actor connection event exceeds the outgoing message limit"
+				))
 			}
 			Err(ActorConnectSendError::Encode(error)) => Err(error),
 		},

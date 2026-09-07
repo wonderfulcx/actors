@@ -67,7 +67,7 @@ impl ScheduleKind {
 		}
 	}
 
-	fn as_i64(self) -> i64 {
+	pub(crate) fn as_i64(self) -> i64 {
 		match self {
 			Self::At => 0,
 			Self::Cron => 1,
@@ -549,7 +549,7 @@ impl ActorContext {
 			.transpose()
 	}
 
-	async fn ensure_schedule_capacity(&self, replacing_existing: bool) -> Result<()> {
+	pub(crate) async fn ensure_schedule_capacity(&self, replacing_existing: bool) -> Result<()> {
 		if replacing_existing {
 			return Ok(());
 		}
@@ -931,10 +931,97 @@ impl ActorContext {
 		Ok(())
 	}
 
+	async fn sync_alarm_checked(&self) -> Result<()> {
+		#[cfg(test)]
+		if self
+			.0
+			.schedule_sync_alarm_failures
+			.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
+				remaining.checked_sub(1)
+			})
+			.is_ok()
+		{
+			anyhow::bail!("injected schedule alarm sync failure");
+		}
+		let next_alarm = min_deadline(
+			self.next_schedule_timestamp(false).await?,
+			self.run_wake_at(),
+		);
+		self.arm_local_alarm(next_alarm);
+		let envoy_handle = self
+			.0
+			.schedule_envoy_handle
+			.lock()
+			.clone()
+			.context("schedule alarm envoy handle is not configured")?;
+		let generation = *self.0.schedule_generation.lock();
+		let (ack_tx, ack_rx) = oneshot::channel();
+		envoy_handle.set_alarm_with_ack(
+			self.actor_id().to_owned(),
+			next_alarm,
+			generation,
+			Some(ack_tx),
+		);
+		ack_rx
+			.await
+			.context("receive scheduled actor alarm acknowledgement")?
+			.map_err(anyhow::Error::msg)?;
+		self.load_last_pushed_alarm(next_alarm);
+		self.persist_last_pushed_alarm(next_alarm).await?;
+		self.0
+			.schedule_dirty_since_push
+			.store(false, Ordering::SeqCst);
+		Ok(())
+	}
+
+	pub(crate) async fn finalize_transactional_schedule_change(&self) {
+		self.mark_schedule_dirty();
+		self.record_schedules_updated();
+		if let Err(error) = self.sync_alarm_checked().await {
+			self.mark_schedule_dirty();
+			tracing::error!(actor_id = %self.actor_id(), ?error, "failed to sync transactional actor alarm; retrying");
+			self.start_schedule_alarm_retry();
+		}
+	}
+
 	pub(crate) async fn sync_alarm_logged(&self) {
 		if let Err(error) = self.sync_alarm().await {
 			tracing::error!(actor_id = %self.actor_id(), ?error, "failed to sync scheduled actor alarm");
 		}
+	}
+
+	fn start_schedule_alarm_retry(&self) {
+		if self
+			.0
+			.schedule_alarm_retry_active
+			.compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+			.is_err()
+		{
+			return;
+		}
+		let ctx = self.clone();
+		let keep_awake = self.keep_awake_region();
+		self.register_task(async move {
+			let _keep_awake = keep_awake;
+			loop {
+				sleep(Duration::from_millis(100)).await;
+				let mutation = ctx.0.schedule_mutation_lock.lock().await;
+				match ctx.sync_alarm_checked().await {
+					Ok(()) if !ctx.0.schedule_dirty_since_push.load(Ordering::SeqCst) => {
+						ctx.0
+							.schedule_alarm_retry_active
+							.store(false, Ordering::SeqCst);
+						drop(mutation);
+						return;
+					}
+					Ok(()) => {}
+					Err(error) => {
+						ctx.mark_schedule_dirty();
+						tracing::error!(actor_id = %ctx.actor_id(), ?error, "scheduled actor alarm retry failed");
+					}
+				}
+			}
+		});
 	}
 
 	pub(crate) async fn sync_future_alarm_logged(&self) {
@@ -1042,17 +1129,33 @@ impl ActorContext {
 			let (persist_done_tx, persist_done_rx) = oneshot::channel();
 			handle.spawn(
 				async move {
-					let _ = ack_rx.await;
-					let is_current = state_ctx.0.schedule_alarm_push_epoch.load(Ordering::SeqCst)
-						== push_epoch && state_ctx.last_pushed_alarm() == timestamp_ms;
-					if is_current
-						&& let Err(error) = state_ctx.persist_last_pushed_alarm(timestamp_ms).await
-					{
-						tracing::error!(
-							?error,
-							?timestamp_ms,
-							"failed to persist last pushed actor alarm"
-						);
+					match ack_rx.await {
+						Ok(Ok(())) => {
+							let is_current =
+								state_ctx.0.schedule_alarm_push_epoch.load(Ordering::SeqCst)
+									== push_epoch;
+							if is_current {
+								state_ctx.load_last_pushed_alarm(timestamp_ms);
+								if let Err(error) =
+									state_ctx.persist_last_pushed_alarm(timestamp_ms).await
+								{
+									state_ctx.mark_schedule_dirty();
+									tracing::error!(
+										?error,
+										?timestamp_ms,
+										"failed to persist last pushed actor alarm"
+									);
+								}
+							}
+						}
+						Ok(Err(error)) => {
+							state_ctx.mark_schedule_dirty();
+							tracing::error!(%error, ?timestamp_ms, "failed to submit actor alarm");
+						}
+						Err(error) => {
+							state_ctx.mark_schedule_dirty();
+							tracing::error!(%error, ?timestamp_ms, "actor alarm acknowledgement dropped");
+						}
 					}
 					let _ = persist_done_tx.send(());
 				}
@@ -1062,9 +1165,7 @@ impl ActorContext {
 				.schedule_pending_alarm_writes
 				.lock()
 				.push(persist_done_rx);
-			return;
 		}
-		self.0.schedule_pending_alarm_writes.lock().push(ack_rx);
 	}
 
 	fn arm_local_alarm(&self, next_alarm: Option<i64>) {

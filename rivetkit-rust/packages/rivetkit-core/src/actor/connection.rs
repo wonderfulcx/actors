@@ -233,7 +233,7 @@ impl ConnHandle {
 	}
 
 	pub fn send(&self, name: &str, args: &[u8]) {
-		if let Err(error) = self.try_send(name, args) {
+		if let Err(error) = self.send_checked(name, args) {
 			tracing::error!(
 				?error,
 				conn_id = self.id(),
@@ -241,6 +241,11 @@ impl ConnHandle {
 				"failed to send event to connection"
 			);
 		}
+	}
+
+	/// Queues an event for delivery and reports transport admission failures.
+	pub fn send_checked(&self, name: &str, args: &[u8]) -> Result<()> {
+		self.try_send(name, args)
 	}
 
 	pub async fn disconnect(&self, reason: Option<&str>) -> Result<()> {
@@ -700,6 +705,12 @@ impl ActorContext {
 		self.reset_sleep_timer();
 
 		Ok(conn)
+	}
+
+	/// Validates that a transactional connection-state delta can be persisted.
+	pub fn validate_hibernation_state_delta(&self, conn_id: &str, bytes: &[u8]) -> Result<()> {
+		self.encode_hibernation_delta(conn_id, bytes.to_vec())?;
+		Ok(())
 	}
 
 	pub(crate) fn encode_hibernation_delta(

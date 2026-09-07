@@ -10,4 +10,6 @@ publish = false
 crate-type = ["cdylib"]
 
 [dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_bare = "0.5"
 wit-bindgen = "=0.51.0"

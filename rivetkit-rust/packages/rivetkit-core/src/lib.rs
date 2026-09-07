@@ -154,6 +154,7 @@ pub use actor::transactional::{
 	PendingTransactionalEffect, TransactionalEffect, TransactionalOperation,
 	TransactionalOperationAdmission, TransactionalOperationFailure, TransactionalOperationKind,
 	TransactionalOperationRecord, TransactionalOperationRequest, TransactionalOperationStatus,
+	TransactionalScheduleUpsert,
 };
 pub use actor::work_registry::{ActorWorkKind, ActorWorkPolicy};
 pub use error::{ActorLifecycle, TransactionalOperationError};

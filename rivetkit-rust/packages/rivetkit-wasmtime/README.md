@@ -22,8 +22,15 @@ V8 dependency.
   uncertain commit fences the actor and also discards the resident.
 - Sandboxed WASI Preview 2 uses closed/sink stdio, no args or environment, no
   filesystem preopens, and deny-by-default networking. WASI HTTP is not linked.
-- Raw HTTP, queues, and connection events fail closed until dedicated transactional
-  adapters are implemented.
+- Hibernating connection open/close callbacks are reserved transactional commands.
+  Socket state joins the aggregate commit; send/broadcast/close intents are delivered
+  afterward by a retrying ordered effect pump. Persisted effects and socket delivery
+  envelopes use versioned BARE generated from `schemas/v1.bare`.
+- One-shot schedule upsert/cancel and effect acknowledgement commit atomically, so
+  delivery retries cannot recreate a fired schedule. Alarm transport admission is
+  acknowledged; failed synchronization retries while keeping the actor awake.
+- Raw HTTP, queues, raw WebSockets, subscriptions, and generic disconnect events fail
+  closed until dedicated transactional adapters are implemented.
 
 The component ABI is defined in [`wit/cell.wit`](wit/cell.wit). A production
 component may embed ComponentizeJS/StarlingMonkey (SpiderMonkey in Wasm) or another

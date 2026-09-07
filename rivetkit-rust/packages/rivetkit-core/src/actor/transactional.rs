@@ -113,6 +113,14 @@ pub struct TransactionalEffect {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TransactionalScheduleUpsert<'a> {
+	pub event_id: &'a str,
+	pub trigger_at: i64,
+	pub action: &'a str,
+	pub args: &'a [u8],
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PendingTransactionalEffect {
 	pub operation_id: String,
 	pub effect_index: u32,
@@ -394,6 +402,95 @@ impl ActorContext {
 			.await
 			.context("mark transactional effect delivered")?;
 		Ok(result.changes == 1)
+	}
+
+	pub async fn apply_transactional_schedule_upsert(
+		&self,
+		operation_id: &str,
+		effect_index: u32,
+		attempted_at: i64,
+		upsert: TransactionalScheduleUpsert<'_>,
+	) -> Result<bool> {
+		if upsert.event_id.is_empty() || upsert.event_id.len() > 256 {
+			bail!("transactional schedule event ID must contain 1 to 256 bytes");
+		}
+		let _mutation = self.0.schedule_mutation_lock.lock().await;
+		let replacing_existing = self.get_scheduled_event(upsert.event_id).await?.is_some();
+		self.ensure_schedule_capacity(replacing_existing).await?;
+		let transaction = self.begin_state_transaction(None).await?;
+		transaction
+			.execute(
+				internal_storage::UPSERT_NAMED_SCHEDULE_EVENT_SQL,
+				Some(vec![
+					BindParam::Text(upsert.event_id.to_owned()),
+					BindParam::Integer(upsert.trigger_at),
+					BindParam::Text(upsert.action.to_owned()),
+					BindParam::Blob(upsert.args.to_vec()),
+					BindParam::Integer(super::schedule::ScheduleKind::At.as_i64()),
+				]),
+			)
+			.await
+			.context("stage transactional schedule upsert")?;
+		let acknowledged = transaction
+			.execute(
+				internal_storage::MARK_TRANSACTIONAL_EFFECT_DELIVERED_SQL,
+				Some(vec![
+					BindParam::Integer(attempted_at),
+					BindParam::Text(operation_id.to_owned()),
+					BindParam::Integer(i64::from(effect_index)),
+				]),
+			)
+			.await
+			.context("stage transactional schedule effect acknowledgement")?;
+		if acknowledged.changes != 1 {
+			transaction.rollback().await?;
+			return Ok(false);
+		}
+		transaction.commit(Vec::new()).await?;
+		self.finalize_transactional_schedule_change().await;
+		Ok(true)
+	}
+
+	pub async fn apply_transactional_schedule_cancel(
+		&self,
+		operation_id: &str,
+		effect_index: u32,
+		attempted_at: i64,
+		event_id: &str,
+	) -> Result<bool> {
+		if event_id.is_empty() || event_id.len() > 256 {
+			bail!("transactional schedule event ID must contain 1 to 256 bytes");
+		}
+		let _mutation = self.0.schedule_mutation_lock.lock().await;
+		let transaction = self.begin_state_transaction(None).await?;
+		transaction
+			.execute(
+				internal_storage::CANCEL_SCHEDULE_SQL,
+				Some(vec![
+					BindParam::Text(event_id.to_owned()),
+					BindParam::Integer(super::schedule::ScheduleKind::At.as_i64()),
+				]),
+			)
+			.await
+			.context("stage transactional schedule cancellation")?;
+		let acknowledged = transaction
+			.execute(
+				internal_storage::MARK_TRANSACTIONAL_EFFECT_DELIVERED_SQL,
+				Some(vec![
+					BindParam::Integer(attempted_at),
+					BindParam::Text(operation_id.to_owned()),
+					BindParam::Integer(i64::from(effect_index)),
+				]),
+			)
+			.await
+			.context("stage transactional schedule cancellation acknowledgement")?;
+		if acknowledged.changes != 1 {
+			transaction.rollback().await?;
+			return Ok(false);
+		}
+		transaction.commit(Vec::new()).await?;
+		self.finalize_transactional_schedule_change().await;
+		Ok(true)
 	}
 
 	pub async fn mark_transactional_effect_attempt_failed(

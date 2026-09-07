@@ -6942,6 +6942,7 @@ version = "2.3.14"
 dependencies = [
  "anyhow",
  "async-trait",
+ "rivet-vbare-compiler",
  "rivetkit-core",
  "serde",
  "serde_bare",
@@ -6949,7 +6950,9 @@ dependencies = [
  "sha2",
  "thiserror 1.0.69",
  "tokio",
+ "tokio-util",
  "tracing",
+ "vbare",
  "wasmtime",
  "wasmtime-wasi",
 ]

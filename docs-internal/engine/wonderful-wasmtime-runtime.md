@@ -52,9 +52,42 @@ cryptographic randomness required by ComponentizeJS. WASI HTTP is not linked, so
 guest cannot perform network requests through the component. Component instantiation
 fails if a guest requests any other undeclared capability.
 
-HTTP, queue, and connection events are rejected until their transactional adapters
-exist. WebSocket and scheduling effects are follow-up work and must preserve the
-same commit-before-visibility rule.
+Raw HTTP, queue, raw WebSocket, subscription, and generic disconnect events remain
+rejected. Managed connection preflight is admitted by the Wonderful transport policy;
+connection open and close callbacks execute as reserved transactional commands.
+A failed open command rejects the connection. Hibernatable connections therefore do
+not keep the actor resident, and wake recreates the component from committed state.
+
+## WebSocket and scheduling effects
+
+Guest output uses bounded `vbare::OwnedVersionedData` payloads generated from
+`rivetkit-wasmtime/schemas/v1.bare`:
+
+- `wonderful.cell.socket.state` becomes a `ConnHibernation` state delta and commits
+  atomically with actor state/result;
+- `wonderful.cell.socket.send` and `.broadcast` deliver only after commit using a
+  stable, versioned `(operation_id, effect_index)` envelope;
+- `wonderful.cell.socket.close` disconnects a live connection after commit;
+- `wonderful.cell.schedule.at` upserts a stable one-shot schedule whose action carries
+  a versioned command envelope;
+- `wonderful.cell.schedule.cancel` removes the stable schedule;
+- `wonderful.cell.destroy` requests actor destruction after commit.
+
+Inbound socket frames enter through the same versioned command envelope as other
+actions; their transport-assigned operation IDs are durably admitted before guest code
+runs and are never replayed once started. `socket:` and `schedule:` operation-ID
+prefixes are server-owned and rejected on external actions. Expired connection-open
+replies cancel the guest invocation and discard its Store before commit.
+
+A per-actor effect pump resumes pending effects on startup and after every command,
+delivers in commit/index order, records failed attempts, and retries with backoff.
+Socket delivery is ordered at-least-once: a crash after transport admission and before
+acknowledgement may duplicate an envelope. Missing closed connections are acknowledged
+as stale best-effort output. Schedule insertion/cancellation and effect acknowledgement
+share one actor-local SQLite transaction, preventing crash redelivery from recreating
+an already-fired schedule. Scheduled targets must be manifest-declared commands. Alarm
+synchronization failures install one actor-scoped retry that keeps the actor awake until
+the local/engine alarm is armed.
 
 ## Query replicas
 

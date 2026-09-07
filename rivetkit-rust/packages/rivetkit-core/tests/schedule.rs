@@ -60,6 +60,27 @@ mod moved_tests {
 	}
 
 	#[tokio::test]
+	async fn transactional_alarm_sync_failure_retries_while_actor_stays_awake() {
+		let ctx = context("transactional-alarm-retry");
+		ctx.fail_next_schedule_alarm_sync_for_tests();
+		ctx.finalize_transactional_schedule_change().await;
+		assert!(
+			ctx.0.schedule_alarm_retry_active.load(Ordering::SeqCst),
+			"failed synchronization must install a retry"
+		);
+		assert_eq!(ctx.keep_awake_count(), 1);
+
+		tokio::time::timeout(Duration::from_secs(1), async {
+			while ctx.0.schedule_alarm_retry_active.load(Ordering::SeqCst) {
+				tokio::time::sleep(Duration::from_millis(10)).await;
+			}
+		})
+		.await
+		.expect("successful alarm synchronization retry");
+		assert_eq!(ctx.keep_awake_count(), 0);
+	}
+
+	#[tokio::test]
 	async fn one_shot_crud_is_sqlite_backed() {
 		let harness = ActorContextHarness::new();
 		let ctx = harness.context("actor-one-shot", "actor", Vec::new(), "local");

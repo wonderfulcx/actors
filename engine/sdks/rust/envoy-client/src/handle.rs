@@ -319,9 +319,9 @@ impl EnvoyHandle {
 		actor_id: String,
 		alarm_ts: Option<i64>,
 		generation: Option<u32>,
-		ack_tx: Option<oneshot::Sender<()>>,
+		ack_tx: Option<oneshot::Sender<Result<(), String>>>,
 	) {
-		let _ = crate::envoy::send_to_envoy_tx(
+		if let Err(error) = crate::envoy::send_to_envoy_tx(
 			&self.shared,
 			ToEnvoyMessage::SetAlarm {
 				actor_id,
@@ -329,7 +329,13 @@ impl EnvoyHandle {
 				alarm_ts,
 				ack_tx,
 			},
-		);
+		) && let ToEnvoyMessage::SetAlarm {
+			ack_tx: Some(ack_tx),
+			..
+		} = error.0
+		{
+			let _ = ack_tx.send(Err("envoy alarm queue is closed".to_owned()));
+		}
 	}
 
 	pub async fn kv_get(

@@ -6,10 +6,20 @@ wit_bindgen::generate!({
 
 use std::cell::RefCell;
 
+use serde::Serialize;
+
 use exports::wonderful::cells::guest::{CommandOutput, Effect, Guest, GuestError};
 
 thread_local! {
     static STATE: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) };
+}
+
+#[derive(Serialize)]
+struct ScheduleAtEffect {
+    schedule_id: String,
+    timestamp_ms: i64,
+    method: String,
+    input: Vec<u8>,
 }
 
 struct TestCell;
@@ -86,13 +96,28 @@ impl Guest for TestCell {
             state.extend_from_slice(&input);
             state.clone()
         });
+        let effects = if name == "schedule" {
+            let mut payload = 1_u16.to_le_bytes().to_vec();
+            payload.extend(
+                serde_bare::to_vec(&ScheduleAtEffect {
+                    schedule_id: "test-alarm".to_owned(),
+                    timestamp_ms: 10_000,
+                    method: "echo".to_owned(),
+                    input: input.clone(),
+                })
+                .expect("encode schedule effect"),
+            );
+            vec![Effect {
+                kind: "wonderful.cell.schedule.at".to_owned(),
+                payload,
+            }]
+        } else {
+            Vec::new()
+        };
         Ok(CommandOutput {
             state,
-            value: input.clone(),
-            effects: vec![Effect {
-                kind: "test".to_owned(),
-                payload: input,
-            }],
+            value: input,
+            effects,
             destroyed: false,
         })
     }

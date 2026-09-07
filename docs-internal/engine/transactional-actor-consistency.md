@@ -62,7 +62,11 @@ but before acknowledgement can redeliver an effect. Destinations must use the
 operation/effect identity for idempotency where available.
 
 No effect may leave the runtime before the aggregate commit. Pending effects
-protect their operation records from retention pruning.
+protect their operation records from retention pruning. The Wonderful Wasmtime
+adapter resumes an ordered per-actor effect pump on startup and after each command.
+Socket output is acknowledged after transport admission and may duplicate after a
+crash. Schedule upsert/cancel and effect acknowledgement use one actor-local SQLite
+transaction, making schedule delivery idempotent across that crash boundary.
 
 ## Actor-local schema
 

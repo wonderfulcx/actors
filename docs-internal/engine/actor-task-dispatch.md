@@ -14,8 +14,11 @@ Routing for actor lifecycle and user-facing work inside `rivetkit-core`. Capture
   a global action lock because unblock/finish actions must run while other
   actions await. Actors explicitly configured with
   `ActorConsistency::Transactional` are the exception: `ActorTask` forwards
-  only one action at a time and releases the next after the transactional
-  runtime replies. See `transactional-actor-consistency.md`.
+  only one command at a time and releases the next after the transactional
+  runtime replies. A runtime may install an action classifier for independently
+  enforced read-only queries; those actions do not consume the transactional
+  slot and can overlap each other, while unclassified/malformed actions default
+  to transactional. See `transactional-actor-consistency.md`.
 - `DispatchCommand::Http` — spawns a `UserTaskKind::Http` child in `ActorTask.children`. Reply flows from that child task.
 - `DispatchCommand::OpenWebSocket` — spawns a `UserTaskKind::WebSocketLifetime` child. Message/close callbacks stay inline under the WebSocket callback guard.
 

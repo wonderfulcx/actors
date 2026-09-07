@@ -15,6 +15,7 @@ pub(crate) const DELETE_CONN_SQL: &str = "DELETE FROM _rivet_conns WHERE conn_id
 
 pub(crate) const RESET_SCHEDULES_FOR_LEGACY_IMPORT_SQL: &str = "DELETE FROM _rivet_schedule_events";
 pub(crate) const INSERT_SCHEDULE_EVENT_SQL: &str = "INSERT INTO _rivet_schedule_events (event_id, trigger_at, action, args, kind, cron_expression, timezone, interval_ms, last_started_at, max_history) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
+pub(crate) const UPSERT_NAMED_SCHEDULE_EVENT_SQL: &str = "INSERT INTO _rivet_schedule_events (event_id, trigger_at, action, args, kind, cron_expression, timezone, interval_ms, last_started_at, max_history) VALUES (?, ?, ?, ?, ?, NULL, NULL, NULL, NULL, 0) ON CONFLICT(event_id) DO UPDATE SET trigger_at = excluded.trigger_at, action = excluded.action, args = excluded.args, kind = excluded.kind, cron_expression = NULL, timezone = NULL, interval_ms = NULL, last_started_at = NULL, max_history = 0";
 pub(crate) const UPSERT_RECURRING_SCHEDULE_SQL: &str = "INSERT INTO _rivet_schedule_events (event_id, trigger_at, action, args, kind, cron_expression, timezone, interval_ms, last_started_at, max_history) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(event_id) DO UPDATE SET trigger_at = excluded.trigger_at, action = excluded.action, args = excluded.args, kind = excluded.kind, cron_expression = excluded.cron_expression, timezone = excluded.timezone, interval_ms = excluded.interval_ms, max_history = excluded.max_history";
 pub(crate) const CANCEL_SCHEDULE_SQL: &str =
 	"DELETE FROM _rivet_schedule_events WHERE event_id = ? AND kind = ?";

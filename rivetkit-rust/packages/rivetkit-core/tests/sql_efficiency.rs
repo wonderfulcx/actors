@@ -718,6 +718,18 @@ fn query_catalog() -> Vec<QueryCase> {
 			expectation: indexed(None, &["_rivet_transactional_runtime"]),
 		},
 		QueryCase {
+			id: "transactional.upsert_named_schedule",
+			sql: queries::UPSERT_NAMED_SCHEDULE_EVENT_SQL.into(),
+			params: vec![
+				text("effect:schedule"),
+				20_000_i64.into(),
+				text("wake"),
+				Value::Blob(vec![1]),
+				0_i64.into(),
+			],
+			expectation: indexed(None, &["_rivet_schedule_events"]),
+		},
+		QueryCase {
 			id: "transactional.load_commit_sequence",
 			sql: queries::LOAD_TRANSACTIONAL_COMMIT_SEQUENCE_SQL.into(),
 			params: vec![],

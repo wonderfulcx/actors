@@ -658,7 +658,7 @@ pub(crate) mod moved_tests {
 				assert_eq!(actor_id, expected_actor_id);
 				assert_eq!(generation, expected_generation);
 				if let Some(ack_tx) = ack_tx {
-					let _ = ack_tx.send(());
+					let _ = ack_tx.send(Ok(()));
 				}
 				alarm_ts
 			}
@@ -2907,8 +2907,8 @@ pub(crate) mod moved_tests {
 			_ => panic!("expected second alarm message"),
 		};
 
-		second_ack.send(()).expect("ack latest alarm");
-		first_ack.send(()).expect("ack stale alarm");
+		second_ack.send(Ok(())).expect("ack latest alarm");
+		first_ack.send(Ok(())).expect("ack stale alarm");
 		ctx.wait_for_pending_alarm_writes().await;
 		assert_eq!(
 			crate::actor::internal_storage::load_last_pushed_alarm(ctx.sql())

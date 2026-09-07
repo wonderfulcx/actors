@@ -61,5 +61,6 @@ pub use transactional::{
 	PendingTransactionalEffect, TransactionalEffect, TransactionalOperation,
 	TransactionalOperationAdmission, TransactionalOperationFailure, TransactionalOperationKind,
 	TransactionalOperationRecord, TransactionalOperationRequest, TransactionalOperationStatus,
+	TransactionalScheduleUpsert,
 };
 pub use work_registry::{ActorWorkKind, ActorWorkPolicy};
