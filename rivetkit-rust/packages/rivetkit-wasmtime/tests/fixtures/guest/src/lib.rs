@@ -22,6 +22,12 @@ struct ScheduleAtEffect {
     input: Vec<u8>,
 }
 
+#[derive(Serialize)]
+struct SocketSendEffect {
+    connection_id: String,
+    payload: Vec<u8>,
+}
+
 struct TestCell;
 
 impl Guest for TestCell {
@@ -36,6 +42,15 @@ impl Guest for TestCell {
     }
 
     fn invoke_command(name: String, input: Vec<u8>) -> Result<CommandOutput, GuestError> {
+        if name == "__wonderful_socket_connect" || name == "__wonderful_socket_close" {
+            let state = STATE.with_borrow(Clone::clone);
+            return Ok(CommandOutput {
+                state,
+                value: Vec::new(),
+                effects: Vec::new(),
+                destroyed: false,
+            });
+        }
         if name == "spin" {
             loop {
                 STATE.with_borrow_mut(|state| {
@@ -45,12 +60,14 @@ impl Guest for TestCell {
             }
         }
         if name == "read" || name == "read_sql" || name == "mutating_query" {
-            if name == "read_sql" {
-                wonderful::cells::host::execute_sql("SELECT value FROM test_values", &[])
-                    .map_err(|message| GuestError {
-                        code: "TEST_SQL_FAILURE".to_owned(),
-                        message,
-                    })?;
+            let value = if name == "read_sql" {
+                let result =
+                    wonderful::cells::host::execute_sql("SELECT value FROM test_values", &[])
+                        .map_err(|message| GuestError {
+                            code: "TEST_SQL_FAILURE".to_owned(),
+                            message,
+                        })?;
+                vec![u8::try_from(result.rows.len()).unwrap_or(u8::MAX)]
             } else if name == "mutating_query" {
                 wonderful::cells::host::execute_sql(
                     "INSERT INTO test_values (value) VALUES (?)",
@@ -60,13 +77,24 @@ impl Guest for TestCell {
                     code: "TEST_SQL_FAILURE".to_owned(),
                     message,
                 })?;
-            }
-            let state = STATE.with_borrow(Clone::clone);
+                Vec::new()
+            } else {
+                STATE.with_borrow(Clone::clone)
+            };
             return Ok(CommandOutput {
-                state: state.clone(),
-                value: state,
+                state: STATE.with_borrow(Clone::clone),
+                value,
                 effects: Vec::new(),
                 destroyed: false,
+            });
+        }
+        if name == "destroy" {
+            let state = STATE.with_borrow(Clone::clone);
+            return Ok(CommandOutput {
+                state,
+                value: input,
+                effects: Vec::new(),
+                destroyed: true,
             });
         }
         if name == "fail" {
@@ -77,6 +105,14 @@ impl Guest for TestCell {
             });
         }
         if name == "sql" {
+            wonderful::cells::host::execute_sql(
+                "CREATE TABLE IF NOT EXISTS test_values (value BLOB NOT NULL)",
+                &[],
+            )
+            .map_err(|message| GuestError {
+                code: "TEST_SQL_FAILURE".to_owned(),
+                message,
+            })?;
             let result = wonderful::cells::host::execute_sql(
                 "INSERT INTO test_values (value) VALUES (?)",
                 &[wonderful::cells::host::SqlValue::Blob(input.clone())],
@@ -92,10 +128,14 @@ impl Guest for TestCell {
                 });
             }
         }
-        let state = STATE.with_borrow_mut(|state| {
-            state.extend_from_slice(&input);
-            state.clone()
-        });
+        let state = if name == "send" {
+            STATE.with_borrow(Clone::clone)
+        } else {
+            STATE.with_borrow_mut(|state| {
+                state.extend_from_slice(&input);
+                state.clone()
+            })
+        };
         let effects = if name == "schedule" {
             let mut payload = 1_u16.to_le_bytes().to_vec();
             payload.extend(
@@ -111,6 +151,25 @@ impl Guest for TestCell {
                 kind: "wonderful.cell.schedule.at".to_owned(),
                 payload,
             }]
+        } else if name == "send" {
+            let connection_id = String::from_utf8(input.clone()).expect("connection ID input");
+            [vec![1], vec![2]]
+                .into_iter()
+                .map(|message| {
+                    let mut payload = 1_u16.to_le_bytes().to_vec();
+                    payload.extend(
+                        serde_bare::to_vec(&SocketSendEffect {
+                            connection_id: connection_id.clone(),
+                            payload: message,
+                        })
+                        .expect("encode socket send effect"),
+                    );
+                    Effect {
+                        kind: "wonderful.cell.socket.send".to_owned(),
+                        payload,
+                    }
+                })
+                .collect()
         } else {
             Vec::new()
         };

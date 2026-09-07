@@ -35,7 +35,7 @@ shutdown deadline can still abort the registered retry.
 
 Two predicates govern the sleep state machine. Both live on `ActorContext` / `SleepState`.
 
-- `can_arm_sleep_timer()` — the idle predicate. Returns `CanSleep::Yes` only when every sleep-affecting counter is zero and the run handler is inactive (or waiting on a queue). Used to start the sleep idle timer.
+- `can_arm_sleep_timer()` — the idle predicate. Returns `CanSleep::Yes` only when every sleep-affecting counter is zero and the run handler is inactive (or waiting on a queue). Non-hibernatable connections block it; hibernatable WebSocket transports do not pin the actor resident. Used to start the sleep idle timer.
 - `can_finalize_sleep()` — the grace predicate. Returns `true` only when every shutdown-affecting counter is zero: `core_dispatched_hooks`, `shutdown_task_count`, `sleep_keep_awake`, `sleep_internal_keep_awake`, `active_http_requests`, `websocket_callbacks`, `pending_disconnects`. Used to advance from `SleepGrace` to `SleepFinalize` (or finalize destroy).
 
 Removing `preventSleep` deleted both predicate branches. Any future sleep-affecting counter must add an entry in each predicate and must call `ActorContext::reset_sleep_timer()` on transitions that change the result.

@@ -496,10 +496,24 @@ impl WonderfulWasmtimeActorFactory {
 						CellMethodMode::Command => {
 							let _writer = execution_gate.write().await;
 							let outcome = self
-								.invoke_action(&ctx, generation, &bundle, &mut resident, name, args)
+								.invoke_action(
+									&ctx,
+									generation,
+									&bundle,
+									&mut resident,
+									name.clone(),
+									args,
+								)
 								.await;
 							match outcome {
 								ActionOutcome::Reply(result) => {
+									if let Err(error) = &result {
+										tracing::warn!(
+											method = %name,
+											?error,
+											"Wonderful Cell command failed"
+										);
+									}
 									reply.send(result);
 									effect_notify.notify_one();
 								}
@@ -537,7 +551,6 @@ impl WonderfulWasmtimeActorFactory {
 					}
 					drop(resident.take());
 					reply.send(Ok(()));
-					break;
 				}
 				ActorEvent::ConnectionClosed { conn } => {
 					let _writer = execution_gate.write().await;
@@ -1630,7 +1643,8 @@ fn prepare_effects(
 				});
 			}
 			SOCKET_BROADCAST_EFFECT => {
-				let broadcast = SocketBroadcastEffect::decode(&effect.payload)?;
+				let broadcast = SocketBroadcastEffect::decode(&effect.payload)
+					.context("decode Cell socket broadcast effect")?;
 				if broadcast.exclude_connection_ids.len() > 1024 {
 					bail!("Cell socket broadcast exceeds 1024 exclusions");
 				}

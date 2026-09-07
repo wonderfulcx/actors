@@ -55,3 +55,14 @@ sha256sum \
 
 The fixture intentionally mutates its ephemeral state before one failure. Tests prove
 that a failed resident is discarded and the replacement sees only committed state.
+
+The production-path fault model additionally requires the engine binary:
+
+```bash
+cargo build -p rivet-engine
+cargo test -p rivetkit-wasmtime --test production_fault_model
+```
+
+It traverses the public engine gateway, Envoy, `CoreRegistry`, remote actor-local
+SQLite, the Wasmtime adapter, hibernating WebSockets, sleep/wake, engine restart, and
+destruction rather than substituting mocks.

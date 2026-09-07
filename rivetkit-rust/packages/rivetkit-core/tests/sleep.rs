@@ -741,6 +741,29 @@ mod moved_tests {
 		}
 	}
 
+	#[tokio::test(start_paused = true)]
+	async fn hibernatable_connections_do_not_pin_the_actor_resident() {
+		use crate::actor::sleep::CanSleep;
+
+		let ctx = ActorContext::new_for_sleep_tests("actor-hibernatable-connection");
+		ctx.set_started(true);
+		ctx.add_conn(crate::ConnHandle::new(
+			"hibernatable",
+			Vec::new(),
+			Vec::new(),
+			true,
+		));
+		assert_eq!(ctx.can_sleep().await, CanSleep::Yes);
+
+		ctx.add_conn(crate::ConnHandle::new(
+			"resident",
+			Vec::new(),
+			Vec::new(),
+			false,
+		));
+		assert_eq!(ctx.can_sleep().await, CanSleep::ActiveConnections);
+	}
+
 	// `set_prevent_sleep` is a deprecated no-op kept for NAPI bridge
 	// compatibility. The exhaustive `CanSleep` match below is a build-time
 	// guard against reintroducing a `PreventSleep` enum variant.

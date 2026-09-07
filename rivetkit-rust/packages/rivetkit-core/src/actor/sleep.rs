@@ -261,7 +261,7 @@ impl ActorContext {
 		if self.pending_disconnect_count() > 0 {
 			return CanSleep::ActiveDisconnectCallbacks;
 		}
-		if !self.conns().is_empty() {
+		if self.conns().any(|connection| !connection.is_hibernatable()) {
 			return CanSleep::ActiveConnections;
 		}
 		if self.websocket_callback_count() > 0 {

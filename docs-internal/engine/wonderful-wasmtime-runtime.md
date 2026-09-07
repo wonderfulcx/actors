@@ -116,4 +116,15 @@ component instance/memory/table limits, fuel budgets for activation and each met
 and a wall-clock method deadline. Fuel exhaustion and traps durably fail the operation
 and discard the resident.
 
+## Production-path fault validation
+
+`rivetkit-wasmtime/tests/production_fault_model.rs` launches the real `rivet-engine`
+binary and serves a real `CoreRegistry` with this factory. It validates operation-ID
+deduplication, concurrent command serialization, immutable query snapshots,
+actor-local SQLite, bundle reload across sleep/wake, hibernating WebSocket restoration,
+ordered post-commit socket envelopes, engine process restart, state/SQLite recovery,
+and Cell-requested destruction. Build `rivet-engine` before running the test target.
+Crate-local tests retain deterministic coverage for pre/post-commit failures and
+indeterminate storage outcomes that cannot yet be injected through the engine API.
+
 See also [Transactional actor consistency](transactional-actor-consistency.md).

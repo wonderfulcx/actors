@@ -562,13 +562,18 @@ fn column_value(stmt: *mut libsqlite3_sys::sqlite3_stmt, index: i32) -> ColumnVa
 			}
 		}
 		SQLITE_BLOB => {
-			let blob_ptr = unsafe { sqlite3_column_blob(stmt, index) };
-			if blob_ptr.is_null() {
-				ColumnValue::Null
+			let blob_len = unsafe { sqlite3_column_bytes(stmt, index) } as usize;
+			if blob_len == 0 {
+				ColumnValue::Blob(Vec::new())
 			} else {
-				let blob_len = unsafe { sqlite3_column_bytes(stmt, index) } as usize;
-				let blob = unsafe { std::slice::from_raw_parts(blob_ptr as *const u8, blob_len) };
-				ColumnValue::Blob(blob.to_vec())
+				let blob_ptr = unsafe { sqlite3_column_blob(stmt, index) };
+				if blob_ptr.is_null() {
+					ColumnValue::Null
+				} else {
+					let blob =
+						unsafe { std::slice::from_raw_parts(blob_ptr as *const u8, blob_len) };
+					ColumnValue::Blob(blob.to_vec())
+				}
 			}
 		}
 		_ => ColumnValue::Null,
@@ -606,14 +611,19 @@ fn column_value_profiled(
 			}
 		}
 		SQLITE_BLOB => {
-			let blob_ptr = unsafe { sqlite3_column_blob(stmt, index) };
-			if blob_ptr.is_null() {
-				ColumnValue::Null
+			let blob_len = unsafe { sqlite3_column_bytes(stmt, index) } as usize;
+			logical_bytes = blob_len as u64;
+			if blob_len == 0 {
+				ColumnValue::Blob(Vec::new())
 			} else {
-				let blob_len = unsafe { sqlite3_column_bytes(stmt, index) } as usize;
-				logical_bytes = blob_len as u64;
-				let blob = unsafe { std::slice::from_raw_parts(blob_ptr as *const u8, blob_len) };
-				ColumnValue::Blob(blob.to_vec())
+				let blob_ptr = unsafe { sqlite3_column_blob(stmt, index) };
+				if blob_ptr.is_null() {
+					ColumnValue::Null
+				} else {
+					let blob =
+						unsafe { std::slice::from_raw_parts(blob_ptr as *const u8, blob_len) };
+					ColumnValue::Blob(blob.to_vec())
+				}
 			}
 		}
 		_ => ColumnValue::Null,
@@ -699,34 +709,31 @@ mod tests {
 		)
 		.unwrap();
 
-		let result = execute_statement(
-			db.as_ptr(),
-			"INSERT INTO items(label, score, payload) VALUES (?, ?, ?);",
-			Some(&[
-				BindParam::Text("alpha".to_owned()),
-				BindParam::Float(3.5),
-				BindParam::Blob(vec![1, 2, 3]),
-			]),
-		)
-		.unwrap();
-		assert_eq!(result.changes, 1);
+		for (label, payload) in [("alpha", vec![1, 2, 3]), ("empty", Vec::new())] {
+			let result = execute_statement(
+				db.as_ptr(),
+				"INSERT INTO items(label, score, payload) VALUES (?, ?, ?);",
+				Some(&[
+					BindParam::Text(label.to_owned()),
+					BindParam::Float(3.5),
+					BindParam::Blob(payload.clone()),
+				]),
+			)
+			.unwrap();
+			assert_eq!(result.changes, 1);
 
-		let rows = query_statement(
-			db.as_ptr(),
-			"SELECT id, label, score, payload FROM items WHERE label = ?;",
-			Some(&[BindParam::Text("alpha".to_owned())]),
-		)
-		.unwrap();
-		assert_eq!(rows.columns, vec!["id", "label", "score", "payload"]);
-		assert_eq!(
-			rows.rows,
-			vec![vec![
-				ColumnValue::Integer(1),
-				ColumnValue::Text("alpha".to_owned()),
-				ColumnValue::Float(3.5),
-				ColumnValue::Blob(vec![1, 2, 3]),
-			]]
-		);
+			let rows = query_statement(
+				db.as_ptr(),
+				"SELECT id, label, score, payload FROM items WHERE label = ?;",
+				Some(&[BindParam::Text(label.to_owned())]),
+			)
+			.unwrap();
+			assert_eq!(rows.columns, vec!["id", "label", "score", "payload"]);
+			assert_eq!(rows.rows.len(), 1);
+			assert_eq!(rows.rows[0][1], ColumnValue::Text(label.to_owned()));
+			assert_eq!(rows.rows[0][2], ColumnValue::Float(3.5));
+			assert_eq!(rows.rows[0][3], ColumnValue::Blob(payload));
+		}
 	}
 
 	#[test]
@@ -777,20 +784,22 @@ mod tests {
 		let db = MemoryDb::open();
 		let (result, profile) = execute_single_statement_profiled(
 			db.as_ptr(),
-			"SELECT ?, ?, ?;",
+			"SELECT ?, ?, ?, ?;",
 			Some(&[
 				BindParam::Integer(7),
 				BindParam::Text("hello".to_owned()),
 				BindParam::Blob(vec![1, 2, 3]),
+				BindParam::Blob(Vec::new()),
 			]),
 		)
 		.unwrap();
 
 		assert_eq!(result.rows.len(), 1);
-		assert_eq!(profile.bind_count, 3);
+		assert_eq!(result.rows[0][3], ColumnValue::Blob(Vec::new()));
+		assert_eq!(profile.bind_count, 4);
 		assert_eq!(profile.bind_logical_bytes, 16);
 		assert_eq!(profile.result_rows, 1);
-		assert_eq!(profile.result_columns, 3);
+		assert_eq!(profile.result_columns, 4);
 		assert_eq!(profile.result_logical_bytes, 16);
 	}
 
