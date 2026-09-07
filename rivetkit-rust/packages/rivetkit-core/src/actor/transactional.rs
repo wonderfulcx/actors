@@ -240,6 +240,24 @@ impl TransactionalOperation {
 }
 
 impl ActorContext {
+	/// Returns the latest committed transactional writer sequence.
+	pub async fn transactional_snapshot_version(&self) -> Result<u64> {
+		let result = self
+			.sql()
+			.query(
+				internal_storage::LOAD_TRANSACTIONAL_COMMIT_SEQUENCE_SQL,
+				None,
+			)
+			.await
+			.context("load transactional snapshot version")?;
+		let row = result
+			.rows
+			.first()
+			.context("transactional runtime row is missing")?;
+		u64::try_from(read_i64(row, 0, "commit_sequence")?)
+			.context("transactional snapshot version is negative")
+	}
+
 	pub async fn begin_transactional_operation(
 		&self,
 		request: TransactionalOperationRequest,

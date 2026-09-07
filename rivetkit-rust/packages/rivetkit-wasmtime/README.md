@@ -12,9 +12,12 @@ V8 dependency.
 - The bundle source and manifest are immutable, length-separated, and SHA-256
   verified before activation.
 - Actor state hydrates the component on activation and after wake/replacement.
-- Commands use Rivet's opt-in transactional operation API. Guest SQLite calls run
-  through the active actor-local transaction. State, result, and buffered effects
-  commit before the action reply becomes visible.
+- Manifest-declared commands use Rivet's opt-in transactional operation API. Guest
+  SQLite calls run through the active actor-local transaction. State, result, and
+  buffered effects commit before the action reply becomes visible.
+- Manifest-declared queries run concurrently in disposable component Stores against
+  a writer-fenced committed state/database version. They receive bounded `SELECT`-only
+  SQL and cannot mutate state or emit effects.
 - Guest failure durably terminalizes the operation and discards the resident. An
   uncertain commit fences the actor and also discards the resident.
 - Sandboxed WASI Preview 2 uses closed/sink stdio, no args or environment, no

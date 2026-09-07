@@ -38,7 +38,7 @@ pub use config::{
 };
 pub use connection::ConnHandle;
 pub use context::{ActorContext, ActorWorkRegion, KeepAwakeRegion, WebSocketCallbackRegion};
-pub use factory::{ActorEntryFn, ActorFactory};
+pub use factory::{ActorActionMode, ActorEntryFn, ActorFactory};
 pub use lifecycle_hooks::{ActorEvents, ActorStart, Reply};
 pub use messages::{
 	ActorEvent, QueueSendResult, QueueSendStatus, Request, Response, StateDelta, WorkflowKvWrite,

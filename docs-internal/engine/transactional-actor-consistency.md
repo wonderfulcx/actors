@@ -96,10 +96,11 @@ shared between active actors. See
 [Wonderful Wasmtime actor runtime](wonderful-wasmtime-runtime.md) for the concrete
 adapter sequence and capability boundary.
 
-## Future read-only queries
+## Read-only query replicas
 
-Transactional commands remain serialized through the canonical writer. Future
-query replicas may run concurrently only against immutable committed snapshots.
-They must have read-only SQLite and reduced host imports, must not share the
-writer's ephemeral heap, and must fail mutation attempts at runtime. Build-time
-query purity checks are ergonomic checks, not the security boundary.
+The Wonderful Wasmtime adapter classifies manifest-declared queries as concurrent
+actions while transactional commands remain serialized through the canonical
+writer. Query replicas run against a writer-fenced committed state/database version,
+have read-only SQL and reduced host capabilities, never share the writer's ephemeral
+heap, and fail mutation attempts at runtime. Build-time query purity checks remain
+ergonomic checks, not the security boundary.

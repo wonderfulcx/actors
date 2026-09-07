@@ -56,11 +56,31 @@ HTTP, queue, and connection events are rejected until their transactional adapte
 exist. WebSocket and scheduling effects are follow-up work and must preserve the
 same commit-before-visibility rule.
 
+## Query replicas
+
+The immutable bundle manifest declares every method as `command` or `query`. The
+versioned action envelope repeats the mode so `ActorTask` can avoid taking the
+transactional dispatch slot for queries; the runtime verifies that untrusted hint
+against the manifest before execution. A mismatch never reaches guest code.
+
+Commands execute on the canonical resident under an exclusive writer gate. Queries
+hold a shared reader gate and create an independent component Store from the current
+committed state and transactional commit sequence. The reader gate keeps the state
+and actor-local database at that version until the query finishes. Query replicas
+never share the writer's heap and are discarded after one call.
+
+Query SQL accepts only one bounded `SELECT` against public tables. Mutable statements,
+CTEs, statement separators, and Rivet internal tables fail with
+`CELL_QUERY_MUTATION_VIOLATION`. The host records attempted SQL mutation even if guest
+code catches the import error. Returned state must exactly equal the snapshot and
+returned effects/destruction intent must be empty, or the query fails with the same
+code.
+
 ## Resource controls
 
-The factory enforces source/manifest/state/result/effect byte limits, component
-instance/memory/table limits, fuel budgets for activation and each command, and a
-wall-clock command deadline. Fuel exhaustion and traps durably fail the operation
+The factory enforces source/manifest/state/result/effect and query-SQL limits,
+component instance/memory/table limits, fuel budgets for activation and each method,
+and a wall-clock method deadline. Fuel exhaustion and traps durably fail the operation
 and discard the resident.
 
 See also [Transactional actor consistency](transactional-actor-consistency.md).

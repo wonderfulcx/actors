@@ -6945,6 +6945,7 @@ dependencies = [
  "rivetkit-core",
  "serde",
  "serde_bare",
+ "serde_json",
  "sha2",
  "thiserror 1.0.69",
  "tokio",

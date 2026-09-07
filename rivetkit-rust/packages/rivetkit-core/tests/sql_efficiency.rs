@@ -718,6 +718,12 @@ fn query_catalog() -> Vec<QueryCase> {
 			expectation: indexed(None, &["_rivet_transactional_runtime"]),
 		},
 		QueryCase {
+			id: "transactional.load_commit_sequence",
+			sql: queries::LOAD_TRANSACTIONAL_COMMIT_SEQUENCE_SQL.into(),
+			params: vec![],
+			expectation: indexed(None, &["_rivet_transactional_runtime"]),
+		},
+		QueryCase {
 			id: "transactional.prune",
 			sql: queries::PRUNE_TRANSACTIONAL_OPERATIONS_SQL.into(),
 			params: vec![5_000_i64.into(), 128_i64.into()],

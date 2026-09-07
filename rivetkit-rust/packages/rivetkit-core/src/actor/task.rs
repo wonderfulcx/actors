@@ -47,6 +47,7 @@ use crate::actor::action::ActionDispatchError;
 use crate::actor::config::ActorConsistency;
 use crate::actor::connection::ConnHandle;
 use crate::actor::context::ActorContext;
+use crate::actor::factory::ActorActionMode;
 use crate::actor::factory::ActorFactory;
 use crate::actor::lifecycle_hooks::{ActorEvents, ActorStart, Reply};
 use crate::actor::messages::{
@@ -921,8 +922,9 @@ impl ActorTask {
 				conn,
 				reply,
 			} => {
-				let transactional =
-					self.factory.config().consistency == ActorConsistency::Transactional;
+				let transactional = self.factory.config().consistency
+					== ActorConsistency::Transactional
+					&& self.factory.action_mode(&name, &args) == ActorActionMode::Transactional;
 				if transactional {
 					self.transactional_dispatch_active = true;
 				}

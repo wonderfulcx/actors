@@ -34,6 +34,31 @@ impl Guest for TestCell {
                 });
             }
         }
+        if name == "read" || name == "read_sql" || name == "mutating_query" {
+            if name == "read_sql" {
+                wonderful::cells::host::execute_sql("SELECT value FROM test_values", &[])
+                    .map_err(|message| GuestError {
+                        code: "TEST_SQL_FAILURE".to_owned(),
+                        message,
+                    })?;
+            } else if name == "mutating_query" {
+                wonderful::cells::host::execute_sql(
+                    "INSERT INTO test_values (value) VALUES (?)",
+                    &[wonderful::cells::host::SqlValue::Blob(input.clone())],
+                )
+                .map_err(|message| GuestError {
+                    code: "TEST_SQL_FAILURE".to_owned(),
+                    message,
+                })?;
+            }
+            let state = STATE.with_borrow(Clone::clone);
+            return Ok(CommandOutput {
+                state: state.clone(),
+                value: state,
+                effects: Vec::new(),
+                destroyed: false,
+            });
+        }
         if name == "fail" {
             STATE.with_borrow_mut(|state| state.extend_from_slice(&input));
             return Err(GuestError {

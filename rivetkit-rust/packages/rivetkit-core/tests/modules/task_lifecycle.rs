@@ -163,6 +163,47 @@ mod moved_tests {
 	}
 
 	#[tokio::test]
+	async fn classified_concurrent_action_does_not_take_the_transactional_slot() {
+		let ctx = crate::actor::context::tests::new_with_kv(
+			"actor-transactional-query",
+			"task-lifecycle",
+			Vec::new(),
+			"local",
+			crate::kv::tests::new_in_memory(),
+		);
+		let factory = Arc::new(
+			ActorFactory::new(
+				ActorConfig {
+					consistency: ActorConsistency::Transactional,
+					..ActorConfig::default()
+				},
+				|_start| Box::pin(async { Ok(()) }),
+			)
+			.with_transactional_operations()
+			.with_action_classifier(|name, _args| {
+				if name == "query" {
+					crate::ActorActionMode::Concurrent
+				} else {
+					crate::ActorActionMode::Transactional
+				}
+			}),
+		);
+		let mut task = new_task_with_factory(ctx, factory);
+		task.lifecycle = crate::actor::task::LifecycleState::Started;
+		let (reply, _reply_rx) = oneshot::channel();
+		task.handle_dispatch(DispatchCommand::Action {
+			name: "query".to_owned(),
+			args: Vec::new(),
+			conn: ConnHandle::new("conn", Vec::new(), Vec::new(), false),
+			reply,
+		})
+		.await;
+
+		assert!(!task.transactional_dispatch_active);
+		assert!(task.accepting_dispatch());
+	}
+
+	#[tokio::test]
 	async fn transactional_factory_is_required_for_transactional_consistency() {
 		let ctx = crate::actor::context::tests::new_with_kv(
 			"actor-transactional-runtime-required",
