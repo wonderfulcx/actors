@@ -3,7 +3,10 @@ use super::*;
 mod moved_tests {
 	use std::time::Duration;
 
-	use super::{ActorConfig, ActorConfigInput, SqliteProfilingConfig, SqliteProfilingConfigInput};
+	use super::{
+		ActorConfig, ActorConfigInput, ActorConsistency, SqliteProfilingConfig,
+		SqliteProfilingConfigInput,
+	};
 
 	#[test]
 	fn actor_config_from_input_applies_overrides() {
@@ -121,6 +124,22 @@ mod moved_tests {
 			..Default::default()
 		};
 		assert!(invalid.validate().is_err());
+	}
+
+	#[test]
+	fn actor_config_transactional_mode_is_explicit_and_defaults_to_concurrent() {
+		assert_eq!(
+			ActorConfig::from_input(ActorConfigInput::default()).consistency,
+			ActorConsistency::Concurrent,
+		);
+		assert_eq!(
+			ActorConfig::from_input(ActorConfigInput {
+				transactional: Some(true),
+				..ActorConfigInput::default()
+			})
+			.consistency,
+			ActorConsistency::Transactional,
+		);
 	}
 
 	#[test]

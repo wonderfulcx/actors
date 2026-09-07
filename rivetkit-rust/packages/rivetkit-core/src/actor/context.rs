@@ -1377,6 +1377,13 @@ impl ActorContext {
 		);
 	}
 
+	pub(crate) fn notify_transactional_dispatch_completed(&self) {
+		self.try_send_lifecycle_event(
+			LifecycleEvent::TransactionalDispatchCompleted,
+			"transactional_dispatch_completed",
+		);
+	}
+
 	pub(crate) fn notify_activity_dirty(&self) -> bool {
 		if self.0.lifecycle_events.read().is_none() {
 			return false;

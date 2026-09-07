@@ -1,0 +1,5 @@
+{
+  "code": "operation_id_conflict",
+  "group": "actor",
+  "message": "Actor operation ID conflicts with an existing operation."
+}

@@ -34,6 +34,20 @@ Immediate saves are the same flow with a zero debounce and a waiter. They must n
 
 Core prepares the SQL batch while holding the save guard, then releases the guard before awaiting SQLite. Waiters that need durability use save-request revisions or the in-flight write counter rather than holding the save guard across I/O.
 
+## Transactional actors
+
+`ActorStateTransaction` is also the aggregate commit primitive for opt-in
+transactional runtimes. `begin_transactional_operation` first commits a durable
+`started` record, then opens an `ActorStateTransaction`. The runtime routes user
+SQL through that handle and supplies actor/connection `StateDelta`s at commit.
+Core adds the terminal result, commit sequence, and buffered effects to the same
+SQLite transaction before applying the deltas. A failed attempt rolls back the
+handle, restoring its state snapshot and discarding all uncommitted SQL.
+
+This mode does not change the ordinary request-save flow. See
+`transactional-actor-consistency.md` for operation recovery and visibility
+rules.
+
 ## Do Not Reintroduce
 
 - Public `set_state` or `mutate_state` on core or NAPI actor contexts.

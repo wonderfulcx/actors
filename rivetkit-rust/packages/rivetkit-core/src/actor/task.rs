@@ -35,6 +35,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow};
+use chrono::Utc;
 use futures::FutureExt;
 #[cfg(test)]
 use parking_lot::Mutex;
@@ -43,6 +44,7 @@ use tokio::task::{JoinError, JoinHandle};
 use tracing::{Instrument, instrument::WithSubscriber};
 
 use crate::actor::action::ActionDispatchError;
+use crate::actor::config::ActorConsistency;
 use crate::actor::connection::ConnHandle;
 use crate::actor::context::ActorContext;
 use crate::actor::factory::ActorFactory;
@@ -55,7 +57,9 @@ use crate::actor::metrics::startup_phase::StartupPhase;
 use crate::actor::state::{PersistedActor, RequestSaveOpts};
 use crate::actor::task_types::ShutdownKind;
 use crate::actor::work_registry::ActorWorkKind;
-use crate::error::{ActorLifecycle as ActorLifecycleError, ActorRuntime};
+use crate::error::{
+	ActorLifecycle as ActorLifecycleError, ActorRuntime, TransactionalOperationError,
+};
 use crate::runtime::RuntimeSpawner;
 #[cfg(test)]
 use crate::time::sleep;
@@ -265,6 +269,7 @@ pub enum LifecycleEvent {
 	},
 	InspectorSerializeRequested,
 	InspectorAttachmentsChanged,
+	TransactionalDispatchCompleted,
 	SleepTick,
 }
 
@@ -275,6 +280,7 @@ impl LifecycleEvent {
 			Self::WorkflowFlushRequested { .. } => "workflow_flush_requested",
 			Self::InspectorSerializeRequested => "inspector_serialize_requested",
 			Self::InspectorAttachmentsChanged => "inspector_attachments_changed",
+			Self::TransactionalDispatchCompleted => "transactional_dispatch_completed",
 			Self::SleepTick => "sleep_tick",
 		}
 	}
@@ -296,6 +302,9 @@ impl PartialEq for LifecycleEvent {
 			}
 			Self::InspectorAttachmentsChanged => {
 				matches!(other, Self::InspectorAttachmentsChanged)
+			}
+			Self::TransactionalDispatchCompleted => {
+				matches!(other, Self::TransactionalDispatchCompleted)
 			}
 			Self::SleepTick => matches!(other, Self::SleepTick),
 		}
@@ -390,6 +399,8 @@ pub struct ActorTask {
 	/// Active sleep-grace idle wait. Polled by the main loop so grace keeps the
 	/// same inbox/timer handling as the started actor.
 	sleep_grace: Option<SleepGraceState>,
+	/// Prevents transactional runtimes from observing more than one dispatch at a time.
+	transactional_dispatch_active: bool,
 }
 
 impl ActorTask {
@@ -439,6 +450,7 @@ impl ActorTask {
 			sleep_deadline: None,
 			shutdown_reply: None,
 			sleep_grace: None,
+			transactional_dispatch_active: false,
 		}
 	}
 
@@ -843,6 +855,9 @@ impl ActorTask {
 			| LifecycleEvent::InspectorAttachmentsChanged => {
 				self.sync_inspector_serialize_deadline();
 			}
+			LifecycleEvent::TransactionalDispatchCompleted => {
+				self.transactional_dispatch_active = false;
+			}
 			LifecycleEvent::SleepTick => {
 				self.on_sleep_tick().await;
 			}
@@ -905,6 +920,11 @@ impl ActorTask {
 				conn,
 				reply,
 			} => {
+				let transactional =
+					self.factory.config().consistency == ActorConsistency::Transactional;
+				if transactional {
+					self.transactional_dispatch_active = true;
+				}
 				tracing::info!(
 					actor_id = %self.ctx.actor_id(),
 					action_name = %name,
@@ -958,9 +978,15 @@ impl ActorTask {
 									let _ = reply.send(Err(error));
 								}
 							}
+							if transactional {
+								ctx.notify_transactional_dispatch_completed();
+							}
 						});
 					}
 					Err(error) => {
+						if transactional {
+							self.transactional_dispatch_active = false;
+						}
 						tracing::warn!(
 							actor_id = %self.ctx.actor_id(),
 							action_name = %action_name_for_log,
@@ -1152,6 +1178,11 @@ impl ActorTask {
 	async fn start_actor(&mut self) -> Result<()> {
 		let mut startup_timer = self.ctx.metrics().begin_startup_timer();
 		let actor_id = self.ctx.actor_id().to_owned();
+		if self.factory.config().consistency == ActorConsistency::Transactional
+			&& !self.factory.supports_transactional_operations()
+		{
+			return Err(TransactionalOperationError::RuntimeRequired.build());
+		}
 		if !self.ctx.started() {
 			self.ctx.configure_sleep(self.factory.config().clone());
 			self.ctx
@@ -1164,6 +1195,20 @@ impl ActorTask {
 		crate::actor::internal_storage::schema::ensure_internal_schema(self.ctx.sql())
 			.await
 			.context("initialize internal sqlite schema")?;
+		if self.factory.config().consistency == ActorConsistency::Transactional {
+			let recovered = self
+				.ctx
+				.recover_interrupted_transactional_operations(Utc::now().timestamp_millis())
+				.await
+				.context("recover interrupted transactional operations")?;
+			if recovered > 0 {
+				tracing::warn!(
+					actor_id = %actor_id,
+					recovered_operations = recovered,
+					"terminalized transactional operations interrupted by a previous actor generation"
+				);
+			}
+		}
 		tracing::debug!(
 			actor_id = %actor_id,
 			duration_ms = duration_ms_f64(schema_started_at.elapsed()),
@@ -1939,7 +1984,7 @@ impl ActorTask {
 		matches!(
 			self.lifecycle,
 			LifecycleState::Started | LifecycleState::SleepGrace | LifecycleState::DestroyGrace
-		)
+		) && !self.transactional_dispatch_active
 	}
 
 	fn sleep_timer_active(&self) -> bool {

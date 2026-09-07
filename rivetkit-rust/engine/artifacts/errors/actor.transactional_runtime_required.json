@@ -1,0 +1,5 @@
+{
+  "code": "transactional_runtime_required",
+  "group": "actor",
+  "message": "Actor transactional runtime is not configured."
+}

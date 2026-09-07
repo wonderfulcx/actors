@@ -18,6 +18,7 @@ pub struct ActorFactory {
 	entry: Box<ActorEntryFn>,
 	manual_startup_ready: bool,
 	streams_request_body: bool,
+	transactional_operations: bool,
 }
 
 #[cfg(feature = "wasm-runtime")]
@@ -36,6 +37,7 @@ impl ActorFactory {
 			entry: Box::new(entry),
 			manual_startup_ready: false,
 			streams_request_body: false,
+			transactional_operations: false,
 		}
 	}
 
@@ -50,12 +52,19 @@ impl ActorFactory {
 			entry: Box::new(entry),
 			manual_startup_ready: true,
 			streams_request_body: false,
+			transactional_operations: false,
 		}
 	}
 
 	/// Declares that this runtime consumes request bodies incrementally.
 	pub fn with_streaming_request_body(mut self) -> Self {
 		self.streams_request_body = true;
+		self
+	}
+
+	/// Declares that this runtime durably commits each operation before replying.
+	pub fn with_transactional_operations(mut self) -> Self {
+		self.transactional_operations = true;
 		self
 	}
 
@@ -69,6 +78,10 @@ impl ActorFactory {
 
 	pub(crate) fn streams_request_body(&self) -> bool {
 		self.streams_request_body
+	}
+
+	pub(crate) fn supports_transactional_operations(&self) -> bool {
+		self.transactional_operations
 	}
 
 	pub async fn start(&self, start: ActorStart) -> Result<()> {
@@ -100,6 +113,7 @@ impl fmt::Debug for ActorFactory {
 			.field("config", &self.config)
 			.field("manual_startup_ready", &self.manual_startup_ready)
 			.field("streams_request_body", &self.streams_request_body)
+			.field("transactional_operations", &self.transactional_operations)
 			.field("entry", &"<boxed entry>")
 			.finish()
 	}

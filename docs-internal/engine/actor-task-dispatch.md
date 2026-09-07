@@ -9,7 +9,13 @@ Routing for actor lifecycle and user-facing work inside `rivetkit-core`. Capture
 
 ## Dispatch commands
 
-- `DispatchCommand::Action` — spawns a `UserTaskKind::Action` child in `ActorTask.children`. Reply flows from that child task. Action children must remain concurrent; do not reintroduce a per-actor action lock because unblock/finish actions need to run while long-running actions await.
+- `DispatchCommand::Action` — forwards an action and tracks its reply as
+  `ActorWorkKind::Action`. Ordinary actors remain concurrent; do not introduce
+  a global action lock because unblock/finish actions must run while other
+  actions await. Actors explicitly configured with
+  `ActorConsistency::Transactional` are the exception: `ActorTask` forwards
+  only one action at a time and releases the next after the transactional
+  runtime replies. See `transactional-actor-consistency.md`.
 - `DispatchCommand::Http` — spawns a `UserTaskKind::Http` child in `ActorTask.children`. Reply flows from that child task.
 - `DispatchCommand::OpenWebSocket` — spawns a `UserTaskKind::WebSocketLifetime` child. Message/close callbacks stay inline under the WebSocket callback guard.
 

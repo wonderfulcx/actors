@@ -35,6 +35,12 @@ Two predicates govern the sleep state machine. Both live on `ActorContext` / `Sl
 
 Removing `preventSleep` deleted both predicate branches. Any future sleep-affecting counter must add an entry in each predicate and must call `ActorContext::reset_sleep_timer()` on transitions that change the result.
 
+Transactional action execution is tracked as `ActorWorkKind::Action`, so it
+blocks both idle sleep and grace finalization until the runtime has durably
+committed or rolled back and replied. A transactional runtime must not reply
+while its operation transaction is still open. Pending committed effect rows do
+not pin a resident; delivery resumes after wake.
+
 ## Grace period and abort signals
 
 - `start_grace(reason)` fires at the start of `SleepGrace` / `DestroyGrace`. It cancels the sleep idle timer, cancels the actor abort signal (`actor_abort_signal`), installs a `SleepGraceState` with the effective grace deadline, and resets the sleep timer to arm the grace tick.

@@ -64,9 +64,19 @@ fn logical_run_wake_metadata_keeps_the_v1_schema_openable() {
 	use rivetkit_actor_persist::versioned::RunWakeAt;
 	use vbare::OwnedVersionedData;
 
-	assert_eq!(INTERNAL_SCHEMA_VERSION, 1);
+	assert_eq!(INTERNAL_SCHEMA_VERSION, 2);
 	let conn = rusqlite::Connection::open_in_memory().expect("open v1 fixture database");
-	initialize_test_schema(&conn).expect("initialize v1 actor schema");
+	conn.execute_batch(CREATE_META_TABLE)
+		.expect("initialize v1 metadata table");
+	for statement in MIGRATIONS[0] {
+		conn.execute_batch(statement)
+			.expect("initialize v1 actor schema");
+	}
+	conn.execute(
+		UPSERT_META_TEXT_SQL,
+		rusqlite::params![SCHEMA_VERSION_KEY, encode_schema_version(1)],
+	)
+	.expect("write v1 schema version");
 	let logical_wake = RunWakeAt::wrap_latest(Some(1_723_456_789_000))
 		.serialize_with_embedded_version(1)
 		.expect("encode logical run wake");

@@ -123,8 +123,8 @@ pub use actor::{kv, sqlite};
 
 pub use actor::action::ActionDispatchError;
 pub use actor::config::{
-	ActionDefinition, ActorConfig, ActorConfigInput, ActorConfigOverrides, CanHibernateWebSocket,
-	SqliteProfilingConfig, SqliteProfilingConfigInput,
+	ActionDefinition, ActorConfig, ActorConfigInput, ActorConfigOverrides, ActorConsistency,
+	CanHibernateWebSocket, SqliteProfilingConfig, SqliteProfilingConfigInput,
 };
 pub use actor::connection::ConnHandle;
 pub use actor::context::{
@@ -150,8 +150,13 @@ pub use actor::task::{
 	LifecycleEvent, LifecycleState,
 };
 pub use actor::task_types::ShutdownKind;
+pub use actor::transactional::{
+	PendingTransactionalEffect, TransactionalEffect, TransactionalOperation,
+	TransactionalOperationAdmission, TransactionalOperationFailure, TransactionalOperationKind,
+	TransactionalOperationRecord, TransactionalOperationRequest, TransactionalOperationStatus,
+};
 pub use actor::work_registry::{ActorWorkKind, ActorWorkPolicy};
-pub use error::ActorLifecycle;
+pub use error::{ActorLifecycle, TransactionalOperationError};
 pub use inspector::{Inspector, InspectorSnapshot};
 pub use registry::{CoreRegistry, EngineSpawnMode, ServeConfig};
 pub use rivet_envoy_client::config::{

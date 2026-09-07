@@ -97,6 +97,18 @@ pub(crate) const UPSERT_INSPECTOR_TOKEN_SQL: &str = "INSERT INTO _rivet_runtime 
 pub(crate) const LOAD_META_TEXT_SQL: &str = "SELECT value FROM _rivet_meta WHERE key = ?";
 pub(crate) const UPSERT_META_TEXT_SQL: &str = "INSERT INTO _rivet_meta (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value";
 
+pub(crate) const INSERT_TRANSACTIONAL_OPERATION_SQL: &str = "INSERT OR IGNORE INTO _rivet_operations (operation_id, input_digest, kind, name, input, status, actor_generation, started_at) VALUES (?, ?, ?, ?, ?, 0, ?, ?)";
+pub(crate) const LOAD_TRANSACTIONAL_OPERATION_SQL: &str = "SELECT operation_id, input_digest, kind, name, input, status, actor_generation, started_at, completed_at, commit_sequence, result, error_group, error_code, error_message, error_metadata FROM _rivet_operations WHERE operation_id = ?";
+pub(crate) const NEXT_TRANSACTIONAL_COMMIT_SEQUENCE_SQL: &str = "UPDATE _rivet_transactional_runtime SET next_commit_sequence = next_commit_sequence + 1 WHERE id = 1 RETURNING next_commit_sequence - 1";
+pub(crate) const COMPLETE_TRANSACTIONAL_OPERATION_SQL: &str = "UPDATE _rivet_operations SET status = 1, completed_at = ?, commit_sequence = ?, result = ?, error_group = NULL, error_code = NULL, error_message = NULL, error_metadata = NULL WHERE operation_id = ? AND status = 0";
+pub(crate) const FAIL_TRANSACTIONAL_OPERATION_SQL: &str = "UPDATE _rivet_operations SET status = ?, completed_at = ?, result = NULL, error_group = ?, error_code = ?, error_message = ?, error_metadata = ? WHERE operation_id = ? AND status = 0";
+pub(crate) const RECOVER_TRANSACTIONAL_OPERATIONS_SQL: &str = "UPDATE _rivet_operations SET status = 3, completed_at = ?, result = NULL, error_group = 'actor', error_code = 'operation_interrupted', error_message = 'Actor operation was interrupted after execution started.', error_metadata = NULL WHERE status = 0";
+pub(crate) const INSERT_TRANSACTIONAL_EFFECT_SQL: &str = "INSERT INTO _rivet_operation_effects (operation_id, effect_index, commit_sequence, kind, payload, status, attempts) VALUES (?, ?, ?, ?, ?, 0, 0)";
+pub(crate) const LOAD_PENDING_TRANSACTIONAL_EFFECTS_SQL: &str = "SELECT operation_id, effect_index, commit_sequence, kind, payload, attempts FROM _rivet_operation_effects INDEXED BY _rivet_operation_effects_pending WHERE status = 0 ORDER BY commit_sequence, effect_index LIMIT ?";
+pub(crate) const MARK_TRANSACTIONAL_EFFECT_DELIVERED_SQL: &str = "UPDATE _rivet_operation_effects SET status = 1, attempts = attempts + 1, last_attempted_at = ? WHERE operation_id = ? AND effect_index = ? AND status = 0";
+pub(crate) const MARK_TRANSACTIONAL_EFFECT_ATTEMPT_FAILED_SQL: &str = "UPDATE _rivet_operation_effects SET attempts = attempts + 1, last_attempted_at = ? WHERE operation_id = ? AND effect_index = ? AND status = 0";
+pub(crate) const PRUNE_TRANSACTIONAL_OPERATIONS_SQL: &str = "DELETE FROM _rivet_operations WHERE operation_id IN (SELECT operation_id FROM _rivet_operations INDEXED BY _rivet_operations_terminal_retention WHERE status IN (1, 2, 3) AND completed_at < ? ORDER BY completed_at, operation_id LIMIT ?) AND NOT EXISTS (SELECT 1 FROM _rivet_operation_effects WHERE _rivet_operation_effects.operation_id = _rivet_operations.operation_id AND status = 0)";
+
 pub(crate) fn user_kv_batch_get_sql(key_count: usize) -> String {
 	let placeholders = std::iter::repeat_n("?", key_count)
 		.collect::<Vec<_>>()

@@ -1,0 +1,5 @@
+{
+  "code": "operation_interrupted",
+  "group": "actor",
+  "message": "Actor operation was interrupted."
+}

@@ -3,7 +3,7 @@ use anyhow::{Context, Result, bail};
 use super::queries::{LOAD_META_TEXT_SQL, UPSERT_META_TEXT_SQL};
 use crate::sqlite::{BindParam, ColumnValue, SqliteBatchStatement, SqliteDb};
 
-pub(crate) const INTERNAL_SCHEMA_VERSION: i64 = 1;
+pub(crate) const INTERNAL_SCHEMA_VERSION: i64 = 2;
 
 const SCHEMA_VERSION_KEY: &str = "schema_version";
 
@@ -27,9 +27,10 @@ CREATE TABLE IF NOT EXISTS _rivet_meta (
 // across runtime releases. Rewriting these entries in place is safe only while
 // no internal schema version has shipped; after release, all changes must be
 // appended as new migrations and INTERNAL_SCHEMA_VERSION must advance.
-pub(crate) const MIGRATIONS: &[&[&str]] = &[&[
-	// W[queue_next_id per enqueue; alarm per head-change; token once | point UPDATE of one column | <100 B | single-row: all runtime singletons on one leaf]
-	r#"
+pub(crate) const MIGRATIONS: &[&[&str]] = &[
+	&[
+		// W[queue_next_id per enqueue; alarm per head-change; token once | point UPDATE of one column | <100 B | single-row: all runtime singletons on one leaf]
+		r#"
 CREATE TABLE _rivet_runtime (
     id                INTEGER PRIMARY KEY CHECK (id = 1),
     last_pushed_alarm INTEGER,
@@ -37,23 +38,23 @@ CREATE TABLE _rivet_runtime (
     queue_next_id     INTEGER NOT NULL
 ) STRICT
 "#,
-	// W[once at init | single INSERT | input <=256 KiB | COLD: never rewritten; overflow chain isolated from hot state]
-	r#"
+		// W[once at init | single INSERT | input <=256 KiB | COLD: never rewritten; overflow chain isolated from hot state]
+		r#"
 CREATE TABLE _rivet_actor (
     id              INTEGER PRIMARY KEY CHECK (id = 1),
     has_initialized INTEGER NOT NULL,
     input           BLOB
 ) STRICT
 "#,
-	// W[debounced save ~1/s + immediate at shutdown | UPDATE state | <=256 KiB | HOT: sole column, so saves dirty only state pages]
-	r#"
+		// W[debounced save ~1/s + immediate at shutdown | UPDATE state | <=256 KiB | HOT: sole column, so saves dirty only state pages]
+		r#"
 CREATE TABLE _rivet_actor_state (
     id    INTEGER PRIMARY KEY CHECK (id = 1),
     state BLOB NOT NULL
 ) STRICT
 "#,
-	// W[per schedule/cancel/fire, immediate | point insert/delete | <200 B | replaces full actor blob rewrite with one row]
-	r#"
+		// W[per schedule/cancel/fire, immediate | point insert/delete | <200 B | replaces full actor blob rewrite with one row]
+		r#"
 CREATE TABLE _rivet_schedule_events (
     event_id         TEXT PRIMARY KEY,
     trigger_at       INTEGER NOT NULL,
@@ -67,12 +68,12 @@ CREATE TABLE _rivet_schedule_events (
     max_history      INTEGER NOT NULL
 ) STRICT, WITHOUT ROWID
 "#,
-	r#"
+		r#"
 CREATE INDEX _rivet_schedule_events_trigger_at
     ON _rivet_schedule_events (trigger_at)
 "#,
-	// W[per recurring fire | point insert/update/prune | bounded rows]
-	r#"
+		// W[per recurring fire | point insert/update/prune | bounded rows]
+		r#"
 CREATE TABLE _rivet_schedule_history (
     id           INTEGER PRIMARY KEY,
     schedule_id  TEXT NOT NULL,
@@ -89,21 +90,21 @@ CREATE TABLE _rivet_schedule_history (
     error_metadata BLOB
 ) STRICT
 "#,
-	r#"
+		r#"
 CREATE INDEX _rivet_schedule_history_schedule
     ON _rivet_schedule_history (schedule_id, fired_at DESC, id DESC)
 "#,
-	r#"
+		r#"
 CREATE INDEX _rivet_schedule_history_fired_at
     ON _rivet_schedule_history (fired_at DESC, id DESC)
 "#,
-	r#"
+		r#"
 CREATE INDEX _rivet_schedule_history_running
     ON _rivet_schedule_history (result)
     WHERE result = 0
 "#,
-	// W[once per connect, DELETE on disconnect | whole row | up to 256 KiB | COLD: immutable per conn, separate from hot message index]
-	r#"
+		// W[once per connect, DELETE on disconnect | whole row | up to 256 KiB | COLD: immutable per conn, separate from hot message index]
+		r#"
 CREATE TABLE _rivet_conns (
     conn_id         TEXT PRIMARY KEY,
     parameters      BLOB NOT NULL,
@@ -113,8 +114,8 @@ CREATE TABLE _rivet_conns (
     request_headers BLOB NOT NULL
 ) STRICT, WITHOUT ROWID
 "#,
-	// W[dirty per WS message, written debounced ~1/s; rewritten at sleep | point UPDATE | ~100-300 B | HOT: compact conn state rows]
-	r#"
+		// W[dirty per WS message, written debounced ~1/s; rewritten at sleep | point UPDATE | ~100-300 B | HOT: compact conn state rows]
+		r#"
 CREATE TABLE _rivet_conn_state (
     conn_id              TEXT PRIMARY KEY,
     state                BLOB NOT NULL,
@@ -123,8 +124,8 @@ CREATE TABLE _rivet_conn_state (
     subscriptions        BLOB NOT NULL
 ) STRICT, WITHOUT ROWID
 "#,
-	// W[per enqueue plus queue_next_id; batch DELETE on receive/ack | append/delete + named FIFO lookup | body <=256 KiB | INTEGER PK plus compact (name, id) index keeps bodies out of name scans]
-	r#"
+		// W[per enqueue plus queue_next_id; batch DELETE on receive/ack | append/delete + named FIFO lookup | body <=256 KiB | INTEGER PK plus compact (name, id) index keeps bodies out of name scans]
+		r#"
 CREATE TABLE _rivet_queue (
     id         INTEGER PRIMARY KEY,
     name       TEXT NOT NULL,
@@ -132,28 +133,90 @@ CREATE TABLE _rivet_queue (
     created_at INTEGER NOT NULL
 ) STRICT
 "#,
-	r#"
+		r#"
 CREATE INDEX _rivet_queue_name_id
     ON _rivet_queue (name, id)
 "#,
-	// RivetKit core owns this table's creation and migrations. External workflow
-	// packages are format-compatible clients and must never create or migrate it;
-	// any format change requires bidirectional old/new compatibility fixtures.
-	// W[per workflow step flush | keyed upsert + range delete | values <=256 KiB | verbatim fdb-tuple keys in one clustered tree]
-	r#"
+		// RivetKit core owns this table's creation and migrations. External workflow
+		// packages are format-compatible clients and must never create or migrate it;
+		// any format change requires bidirectional old/new compatibility fixtures.
+		// W[per workflow step flush | keyed upsert + range delete | values <=256 KiB | verbatim fdb-tuple keys in one clustered tree]
+		r#"
 CREATE TABLE _rivet_wf_kv (
     key   BLOB PRIMARY KEY,
     value BLOB NOT NULL
 ) STRICT, WITHOUT ROWID
 "#,
-	// W[per c.kv op (deprecated) | keyed upsert/delete/range | values <=128 KiB | verbatim raw KV key bytes]
-	r#"
+		// W[per c.kv op (deprecated) | keyed upsert/delete/range | values <=128 KiB | verbatim raw KV key bytes]
+		r#"
 CREATE TABLE _rivet_user_kv (
     key   BLOB PRIMARY KEY,
     value BLOB NOT NULL
 ) STRICT, WITHOUT ROWID
 	"#,
-]];
+	],
+	&[
+		// W[per transactional operation admission and terminalization | point insert/update | input/result each <=256 KiB | bounded by ActorConfig transactional retention]
+		r#"
+CREATE TABLE _rivet_operations (
+    operation_id      TEXT PRIMARY KEY,
+    input_digest      BLOB NOT NULL,
+    kind              INTEGER NOT NULL,
+    name              TEXT NOT NULL,
+    input             BLOB NOT NULL,
+    status            INTEGER NOT NULL,
+    actor_generation  INTEGER NOT NULL,
+    started_at        INTEGER NOT NULL,
+    completed_at      INTEGER,
+    commit_sequence   INTEGER,
+    result            BLOB,
+    error_group       TEXT,
+    error_code        TEXT,
+    error_message     TEXT,
+    error_metadata    BLOB
+) STRICT
+"#,
+		r#"
+CREATE INDEX _rivet_operations_status_started
+ON _rivet_operations (status, started_at, operation_id)
+"#,
+		r#"
+CREATE INDEX _rivet_operations_terminal_retention
+ON _rivet_operations (completed_at, operation_id)
+WHERE status IN (1, 2, 3)
+"#,
+		// W[per committed transactional effect | append plus ordered pending scan | payload <=256 KiB | bounded by operation retention]
+		r#"
+CREATE TABLE _rivet_operation_effects (
+    operation_id      TEXT NOT NULL,
+    effect_index      INTEGER NOT NULL,
+    commit_sequence   INTEGER NOT NULL,
+    kind              TEXT NOT NULL,
+    payload           BLOB NOT NULL,
+    status            INTEGER NOT NULL,
+    attempts          INTEGER NOT NULL,
+    last_attempted_at INTEGER,
+    PRIMARY KEY (operation_id, effect_index),
+    FOREIGN KEY (operation_id) REFERENCES _rivet_operations(operation_id) ON DELETE CASCADE
+) STRICT, WITHOUT ROWID
+"#,
+		r#"
+CREATE INDEX _rivet_operation_effects_pending
+ON _rivet_operation_effects (status, commit_sequence, effect_index)
+"#,
+		// W[per successful transactional operation | point UPDATE | single-row monotonic counter]
+		r#"
+CREATE TABLE _rivet_transactional_runtime (
+    id                   INTEGER PRIMARY KEY CHECK (id = 1),
+    next_commit_sequence INTEGER NOT NULL
+) STRICT
+"#,
+		r#"
+INSERT INTO _rivet_transactional_runtime (id, next_commit_sequence)
+VALUES (1, 1)
+"#,
+	],
+];
 
 pub(crate) async fn ensure_internal_schema(db: &SqliteDb) -> Result<()> {
 	db.execute(CREATE_META_TABLE, None)

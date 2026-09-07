@@ -122,6 +122,12 @@ fn fixture(row_count: usize) -> Connection {
 	let mut history_insert = tx
 		.prepare("INSERT INTO _rivet_schedule_history (schedule_id, action, scheduled_at, fired_at, finished_at, result) VALUES (?, 'run', ?, ?, ?, ?)")
 		.expect("prepare history seed");
+	let mut operation_insert = tx
+		.prepare("INSERT INTO _rivet_operations (operation_id, input_digest, kind, name, input, status, actor_generation, started_at, completed_at, commit_sequence, result, error_group, error_code, error_message, error_metadata) VALUES (?, x'01', 0, 'run', x'02', ?, 1, ?, ?, ?, x'03', NULL, NULL, NULL, NULL)")
+		.expect("prepare transactional operation seed");
+	let mut effect_insert = tx
+		.prepare("INSERT INTO _rivet_operation_effects (operation_id, effect_index, commit_sequence, kind, payload, status, attempts, last_attempted_at) VALUES (?, 0, ?, 'socket_send', x'03', ?, 0, NULL)")
+		.expect("prepare transactional effect seed");
 	for index in 0..row_count {
 		let key = format!("{index:08}");
 		conn_insert.execute([&key]).expect("seed connection");
@@ -152,6 +158,26 @@ fn fixture(row_count: usize) -> Connection {
 				if index % 997 == 0 { 0_i64 } else { 1_i64 },
 			))
 			.expect("seed schedule history");
+		let operation_id = format!("op:{key}");
+		let operation_status = if index % 997 == 0 { 1_i64 } else { 2_i64 };
+		operation_insert
+			.execute((
+				&operation_id,
+				operation_status,
+				index as i64,
+				index as i64,
+				index as i64 + 1,
+			))
+			.expect("seed transactional operation");
+		if index % 4 == 0 {
+			effect_insert
+				.execute((
+					&operation_id,
+					index as i64 + 1,
+					if index % 8 == 0 { 0_i64 } else { 1_i64 },
+				))
+				.expect("seed transactional effect");
+		}
 	}
 	drop(conn_insert);
 	drop(conn_state_insert);
@@ -159,6 +185,13 @@ fn fixture(row_count: usize) -> Connection {
 	drop(user_kv_insert);
 	drop(schedule_insert);
 	drop(history_insert);
+	drop(operation_insert);
+	drop(effect_insert);
+	tx.execute(
+		"UPDATE _rivet_transactional_runtime SET next_commit_sequence = ? WHERE id = 1",
+		[row_count as i64 + 1],
+	)
+	.expect("seed transactional runtime sequence");
 	tx.commit().expect("commit fixture seed");
 	db.execute_batch("ANALYZE").expect("analyze fixture");
 	db
@@ -245,7 +278,7 @@ fn execute_with_status(db: &Connection, sql: &str, params: &[Value]) -> Statemen
 	] {
 		statement.reset_status(status);
 	}
-	if statement.readonly() {
+	if statement.readonly() || statement.column_count() > 0 {
 		let mut rows = statement
 			.query(params_from_iter(params.iter()))
 			.expect("execute measured query");
@@ -647,6 +680,51 @@ fn query_catalog() -> Vec<QueryCase> {
 					bound: "periodic pruning retains 9,900 rows, leaving headroom beneath MAX_ACTOR_HISTORY",
 				}],
 			},
+		},
+		QueryCase {
+			id: "transactional.load_operation",
+			sql: queries::LOAD_TRANSACTIONAL_OPERATION_SQL.into(),
+			params: vec![text("op:00000050")],
+			expectation: indexed(None, &["_rivet_operations"]),
+		},
+		QueryCase {
+			id: "transactional.recover_started",
+			sql: queries::RECOVER_TRANSACTIONAL_OPERATIONS_SQL.into(),
+			params: vec![20_000_i64.into()],
+			expectation: indexed(
+				Some("_rivet_operations_status_started"),
+				&["_rivet_operations"],
+			),
+		},
+		QueryCase {
+			id: "transactional.pending_effects",
+			sql: queries::LOAD_PENDING_TRANSACTIONAL_EFFECTS_SQL.into(),
+			params: vec![32_i64.into()],
+			expectation: indexed(
+				Some("_rivet_operation_effects_pending"),
+				&["_rivet_operation_effects"],
+			),
+		},
+		QueryCase {
+			id: "transactional.ack_effect",
+			sql: queries::MARK_TRANSACTIONAL_EFFECT_DELIVERED_SQL.into(),
+			params: vec![20_000_i64.into(), text("op:00000000"), 0_i64.into()],
+			expectation: indexed(None, &["_rivet_operation_effects"]),
+		},
+		QueryCase {
+			id: "transactional.next_commit_sequence",
+			sql: queries::NEXT_TRANSACTIONAL_COMMIT_SEQUENCE_SQL.into(),
+			params: vec![],
+			expectation: indexed(None, &["_rivet_transactional_runtime"]),
+		},
+		QueryCase {
+			id: "transactional.prune",
+			sql: queries::PRUNE_TRANSACTIONAL_OPERATIONS_SQL.into(),
+			params: vec![5_000_i64.into(), 128_i64.into()],
+			expectation: indexed(
+				Some("_rivet_operations_terminal_retention"),
+				&["_rivet_operations", "_rivet_operation_effects"],
+			),
 		},
 		QueryCase {
 			id: "cleanup.select_chunk",
