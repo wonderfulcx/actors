@@ -15,20 +15,31 @@ V8 dependency.
 - Manifest-declared commands use Rivet's opt-in transactional operation API. Guest
   SQLite calls run through the active actor-local transaction. State, result, and
   buffered effects commit before the action reply becomes visible.
-- Manifest-declared queries run concurrently in disposable component Stores against
-  a writer-fenced committed state/database version. They receive bounded `SELECT`-only
-  SQL and cannot mutate state or emit effects.
+- Manifest-declared queries run concurrently, up to a strict per-actor limit, in
+  disposable component Stores against a writer-fenced committed state/database version.
+  They receive bounded `SELECT`-only SQL and cannot mutate state or emit effects.
+- All guest SQL denies Rivet/SQLite metadata and extension surfaces. SQL text, parameters,
+  rows, and result bytes are bounded before or during executor materialization.
 - Guest failure durably terminalizes the operation and discards the resident. An
   uncertain commit fences the actor and also discards the resident.
 - Sandboxed WASI Preview 2 uses closed/sink stdio, no args or environment, no
   filesystem preopens, and deny-by-default networking. WASI HTTP is not linked.
 - Hibernating connection open/close callbacks are reserved transactional commands.
   Socket state joins the aggregate commit; send/broadcast/close intents are delivered
-  afterward by a retrying ordered effect pump. Persisted effects and socket delivery
-  envelopes use versioned BARE generated from `schemas/v1.bare`.
-- One-shot schedule upsert/cancel and effect acknowledgement commit atomically, so
-  delivery retries cannot recreate a fired schedule. Alarm transport admission is
-  acknowledged; failed synchronization retries while keeping the actor awake.
+  afterward by a retrying ordered effect pump that holds internal keep-awake while work
+  remains and acknowledges socket output only after active Envoy writer admission.
+  Persisted effects and socket delivery envelopes use versioned BARE generated from
+  `schemas/v1.bare`.
+- One-shot schedule upsert/cancel mutations commit with the command aggregate; ordered
+  effects reconcile alarm transport and acknowledge idempotently. Due one-shots remain
+  durable until their action replies, and persisted claim tokens fence replacement races.
+  Alarm writer admission is acknowledged, every generation idempotently resubmits the
+  persisted alarm, and failed synchronization retries while keeping the actor awake.
+- Effect-producing commands are backpressured at a bounded pending-operation limit, while
+  unprotected terminal operations are compacted after every delivery attempt. Committed
+  destruction bypasses effect backpressure so deletion remains available.
+- Committed destruction establishes the local admission fence before replying. The
+  durable destroy intent remains pending until engine-owned destruction removes the actor.
 - Raw HTTP, queues, raw WebSockets, subscriptions, and generic disconnect events fail
   closed until dedicated transactional adapters are implemented.
 

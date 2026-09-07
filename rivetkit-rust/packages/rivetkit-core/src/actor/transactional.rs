@@ -154,6 +154,86 @@ impl TransactionalOperation {
 		self.transaction.execute(sql, params).await
 	}
 
+	#[doc(hidden)]
+	pub async fn pending_effect_operation_count(&self) -> Result<u64> {
+		let result = self
+			.transaction
+			.execute(
+				internal_storage::COUNT_PENDING_TRANSACTIONAL_EFFECT_OPERATIONS_SQL,
+				None,
+			)
+			.await
+			.context("count pending effect operations in transaction")?;
+		decode_count(&result.rows, "pending transactional effect operation count")
+	}
+
+	#[doc(hidden)]
+	pub async fn stage_schedule_upsert(
+		&self,
+		upsert: TransactionalScheduleUpsert<'_>,
+	) -> Result<()> {
+		let existing = !self
+			.transaction
+			.execute(
+				internal_storage::LOAD_SCHEDULE_SQL,
+				Some(vec![BindParam::Text(upsert.event_id.to_owned())]),
+			)
+			.await
+			.context("load staged transactional schedule")?
+			.rows
+			.is_empty();
+		if !existing {
+			let count = self
+				.transaction
+				.execute(internal_storage::COUNT_SCHEDULES_SQL, None)
+				.await
+				.context("count staged transactional schedules")?
+				.rows
+				.first()
+				.and_then(|row| row.first())
+				.and_then(|value| match value {
+					ColumnValue::Integer(value) => Some(*value),
+					_ => None,
+				})
+				.context("transactional schedule count is not an integer")?;
+			if count >= i64::from(self.ctx.0.max_schedules) {
+				return Err(crate::error::ScheduleRuntimeError::MaxSchedulesExceeded {
+					maximum: self.ctx.0.max_schedules,
+				}
+				.build());
+			}
+		}
+		self.transaction
+			.execute(
+				internal_storage::UPSERT_NAMED_SCHEDULE_EVENT_SQL,
+				Some(vec![
+					BindParam::Text(upsert.event_id.to_owned()),
+					BindParam::Integer(upsert.trigger_at),
+					BindParam::Text(upsert.action.to_owned()),
+					BindParam::Blob(upsert.args.to_vec()),
+					BindParam::Integer(super::schedule::ScheduleKind::At.as_i64()),
+				]),
+			)
+			.await
+			.context("stage transactional schedule upsert")?;
+		Ok(())
+	}
+
+	#[doc(hidden)]
+	pub async fn stage_schedule_cancel(&self, event_id: &str) -> Result<()> {
+		self.transaction
+			.execute(
+				internal_storage::CANCEL_SCHEDULE_SQL,
+				Some(vec![
+					BindParam::Text(event_id.to_owned()),
+					BindParam::Integer(super::schedule::ScheduleKind::At.as_i64()),
+				]),
+			)
+			.await
+			.context("stage transactional schedule cancellation")?;
+		Ok(())
+	}
+
 	pub async fn commit(
 		self,
 		deltas: Vec<StateDelta>,
@@ -361,6 +441,30 @@ impl ActorContext {
 		u64::try_from(result.changes).context("recovered operation count is negative")
 	}
 
+	pub async fn has_pending_transactional_effect_kind(&self, kind: &str) -> Result<bool> {
+		let result = self
+			.sql()
+			.execute(
+				internal_storage::HAS_PENDING_TRANSACTIONAL_EFFECT_KIND_SQL,
+				Some(vec![BindParam::Text(kind.to_owned())]),
+			)
+			.await
+			.context("check pending transactional effect kind")?;
+		Ok(!result.rows.is_empty())
+	}
+
+	pub async fn pending_transactional_effect_operation_count(&self) -> Result<u64> {
+		let result = self
+			.sql()
+			.query(
+				internal_storage::COUNT_PENDING_TRANSACTIONAL_EFFECT_OPERATIONS_SQL,
+				None,
+			)
+			.await
+			.context("count operations with pending transactional effects")?;
+		decode_count(&result.rows, "pending transactional effect operation count")
+	}
+
 	pub async fn pending_transactional_effects(
 		&self,
 		limit: u32,
@@ -404,33 +508,18 @@ impl ActorContext {
 		Ok(result.changes == 1)
 	}
 
-	pub async fn apply_transactional_schedule_upsert(
+	pub async fn acknowledge_transactional_schedule_change(
 		&self,
 		operation_id: &str,
 		effect_index: u32,
 		attempted_at: i64,
-		upsert: TransactionalScheduleUpsert<'_>,
+		event_id: &str,
 	) -> Result<bool> {
-		if upsert.event_id.is_empty() || upsert.event_id.len() > 256 {
+		if event_id.is_empty() || event_id.len() > 256 {
 			bail!("transactional schedule event ID must contain 1 to 256 bytes");
 		}
 		let _mutation = self.0.schedule_mutation_lock.lock().await;
-		let replacing_existing = self.get_scheduled_event(upsert.event_id).await?.is_some();
-		self.ensure_schedule_capacity(replacing_existing).await?;
 		let transaction = self.begin_state_transaction(None).await?;
-		transaction
-			.execute(
-				internal_storage::UPSERT_NAMED_SCHEDULE_EVENT_SQL,
-				Some(vec![
-					BindParam::Text(upsert.event_id.to_owned()),
-					BindParam::Integer(upsert.trigger_at),
-					BindParam::Text(upsert.action.to_owned()),
-					BindParam::Blob(upsert.args.to_vec()),
-					BindParam::Integer(super::schedule::ScheduleKind::At.as_i64()),
-				]),
-			)
-			.await
-			.context("stage transactional schedule upsert")?;
 		let acknowledged = transaction
 			.execute(
 				internal_storage::MARK_TRANSACTIONAL_EFFECT_DELIVERED_SQL,
@@ -447,48 +536,9 @@ impl ActorContext {
 			return Ok(false);
 		}
 		transaction.commit(Vec::new()).await?;
-		self.finalize_transactional_schedule_change().await;
-		Ok(true)
-	}
-
-	pub async fn apply_transactional_schedule_cancel(
-		&self,
-		operation_id: &str,
-		effect_index: u32,
-		attempted_at: i64,
-		event_id: &str,
-	) -> Result<bool> {
-		if event_id.is_empty() || event_id.len() > 256 {
-			bail!("transactional schedule event ID must contain 1 to 256 bytes");
-		}
-		let _mutation = self.0.schedule_mutation_lock.lock().await;
-		let transaction = self.begin_state_transaction(None).await?;
-		transaction
-			.execute(
-				internal_storage::CANCEL_SCHEDULE_SQL,
-				Some(vec![
-					BindParam::Text(event_id.to_owned()),
-					BindParam::Integer(super::schedule::ScheduleKind::At.as_i64()),
-				]),
-			)
-			.await
-			.context("stage transactional schedule cancellation")?;
-		let acknowledged = transaction
-			.execute(
-				internal_storage::MARK_TRANSACTIONAL_EFFECT_DELIVERED_SQL,
-				Some(vec![
-					BindParam::Integer(attempted_at),
-					BindParam::Text(operation_id.to_owned()),
-					BindParam::Integer(i64::from(effect_index)),
-				]),
-			)
-			.await
-			.context("stage transactional schedule cancellation acknowledgement")?;
-		if acknowledged.changes != 1 {
-			transaction.rollback().await?;
-			return Ok(false);
-		}
-		transaction.commit(Vec::new()).await?;
+		// The schedule row was already mutated by the originating aggregate.
+		// Reconcile transport from current committed state rather than replaying
+		// stale upserts/cancels over newer commands.
 		self.finalize_transactional_schedule_change().await;
 		Ok(true)
 	}
@@ -514,6 +564,18 @@ impl ActorContext {
 		Ok(result.changes == 1)
 	}
 
+	pub async fn compact_transactional_operations(&self, retain: u32) -> Result<u64> {
+		let result = self
+			.sql()
+			.execute(
+				internal_storage::COMPACT_TRANSACTIONAL_OPERATIONS_SQL,
+				Some(vec![BindParam::Integer(i64::from(retain))]),
+			)
+			.await
+			.context("compact terminal transactional operations")?;
+		u64::try_from(result.changes).context("compacted operation count is negative")
+	}
+
 	pub async fn prune_transactional_operations(
 		&self,
 		completed_before: i64,
@@ -535,6 +597,18 @@ impl ActorContext {
 			.context("prune terminal transactional operations")?;
 		u64::try_from(result.changes).context("pruned operation count is negative")
 	}
+}
+
+fn decode_count(rows: &[Vec<ColumnValue>], label: &str) -> Result<u64> {
+	let count = rows
+		.first()
+		.and_then(|row| row.first())
+		.and_then(|value| match value {
+			ColumnValue::Integer(value) => Some(*value),
+			_ => None,
+		})
+		.with_context(|| format!("{label} is not an integer"))?;
+	u64::try_from(count).with_context(|| format!("{label} is negative"))
 }
 
 async fn persist_terminal_failure(

@@ -4,16 +4,17 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, anyhow, bail};
 use async_trait::async_trait;
+use rivet_error::RivetError;
 use rivetkit_core::{
 	ActorActionMode, ActorConfig, ActorConsistency, ActorEvent, ActorFactory, ActorStart,
-	BindParam, ColumnValue, PendingTransactionalEffect, StateDelta, TransactionalEffect,
-	TransactionalOperation, TransactionalOperationAdmission, TransactionalOperationError,
-	TransactionalOperationFailure, TransactionalOperationKind, TransactionalOperationRequest,
-	TransactionalOperationStatus, TransactionalScheduleUpsert,
+	BindParam, ColumnValue, ConnectionProtocol, PendingTransactionalEffect, StateDelta,
+	TransactionalEffect, TransactionalOperation, TransactionalOperationAdmission,
+	TransactionalOperationError, TransactionalOperationFailure, TransactionalOperationKind,
+	TransactionalOperationRequest, TransactionalOperationStatus, TransactionalScheduleUpsert,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use tokio::sync::{Mutex, Notify, RwLock};
+use tokio::sync::{Mutex, Notify, RwLock, Semaphore};
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 use vbare::OwnedVersionedData;
@@ -69,6 +70,8 @@ pub struct WonderfulWasmtimeLimits {
 	pub max_result_bytes: usize,
 	pub max_effects: usize,
 	pub max_effect_bytes: usize,
+	pub max_total_effect_bytes: usize,
+	pub max_effect_kind_bytes: usize,
 	pub max_sql_bytes: usize,
 	pub max_sql_params: usize,
 	pub max_sql_param_bytes: usize,
@@ -76,6 +79,11 @@ pub struct WonderfulWasmtimeLimits {
 	pub max_sql_result_bytes: usize,
 	pub max_linear_memory_bytes: usize,
 	pub max_component_instances: usize,
+	pub max_component_memories: usize,
+	pub max_component_tables: usize,
+	pub max_table_elements: usize,
+	pub max_concurrent_queries: usize,
+	pub max_transactional_operations: u32,
 	pub fuel_per_activation: u64,
 	pub fuel_per_command: u64,
 	pub activation_timeout: Duration,
@@ -91,6 +99,8 @@ impl Default for WonderfulWasmtimeLimits {
 			max_result_bytes: DEFAULT_MAX_RESULT_BYTES,
 			max_effects: DEFAULT_MAX_EFFECTS,
 			max_effect_bytes: DEFAULT_MAX_EFFECT_BYTES,
+			max_total_effect_bytes: 1024 * 1024,
+			max_effect_kind_bytes: 128,
 			max_sql_bytes: DEFAULT_MAX_SQL_BYTES,
 			max_sql_params: DEFAULT_MAX_SQL_PARAMS,
 			max_sql_param_bytes: DEFAULT_MAX_SQL_PARAM_BYTES,
@@ -98,6 +108,11 @@ impl Default for WonderfulWasmtimeLimits {
 			max_sql_result_bytes: DEFAULT_MAX_SQL_RESULT_BYTES,
 			max_linear_memory_bytes: 128 * 1024 * 1024,
 			max_component_instances: 64,
+			max_component_memories: 4,
+			max_component_tables: 16,
+			max_table_elements: 1_000_000,
+			max_concurrent_queries: 8,
+			max_transactional_operations: 10_000,
 			fuel_per_activation: 100_000_000,
 			fuel_per_command: 100_000_000,
 			activation_timeout: Duration::from_secs(10),
@@ -458,6 +473,28 @@ impl WonderfulWasmtimeActorFactory {
 			}
 		};
 
+		let pending_destroy = match ctx
+			.has_pending_transactional_effect_kind(DESTROY_EFFECT)
+			.await
+		{
+			Ok(pending) => pending,
+			Err(error) => {
+				if let Some(startup_ready) = startup_ready {
+					let _ = startup_ready.send(Err(anyhow!("Cell destruction recovery failed")));
+				}
+				return Err(error.context("recover pending Cell destruction"));
+			}
+		};
+		if pending_destroy && !ctx.is_destroy_requested() {
+			if let Err(error) = ctx.destroy() {
+				if let Some(startup_ready) = startup_ready {
+					let _ = startup_ready.send(Err(anyhow!("Cell destruction recovery failed")));
+				}
+				return Err(error.context("resume pending Cell destruction"));
+			}
+		}
+
+		let execution_gate = Arc::new(RwLock::new(()));
 		let effect_notify = Arc::new(Notify::new());
 		let effect_cancel = CancellationToken::new();
 		let _effect_cancel_guard = effect_cancel.clone().drop_guard();
@@ -465,13 +502,16 @@ impl WonderfulWasmtimeActorFactory {
 			ctx.clone(),
 			Arc::clone(&effect_notify),
 			effect_cancel.clone(),
+			Arc::clone(&execution_gate),
+			self.limits.max_transactional_operations,
 		)));
 		if let Some(startup_ready) = startup_ready {
 			let _ = startup_ready.send(Ok(()));
 		}
 		effect_notify.notify_one();
-		let execution_gate = Arc::new(RwLock::new(()));
+		let query_slots = Arc::new(Semaphore::new(self.limits.max_concurrent_queries));
 		let mut queries = JoinSet::new();
+		let mut request_connections = BTreeSet::new();
 		while let Some(event) = events.recv().await {
 			match event {
 				ActorEvent::Action {
@@ -517,6 +557,11 @@ impl WonderfulWasmtimeActorFactory {
 									reply.send(result);
 									effect_notify.notify_one();
 								}
+								ActionOutcome::DestroyReply(result) => {
+									reply.send(Ok(result));
+									ctx.submit_fenced_destroy()?;
+									effect_notify.notify_one();
+								}
 								ActionOutcome::Fence(error) => {
 									drop(reply);
 									queries.abort_all();
@@ -529,11 +574,19 @@ impl WonderfulWasmtimeActorFactory {
 							}
 						}
 						CellMethodMode::Query => {
+							let Ok(query_slot) = Arc::clone(&query_slots).try_acquire_owned()
+							else {
+								reply.send(Err(anyhow!(
+									"CELL_QUERY_OVERLOADED: concurrent query limit reached"
+								)));
+								continue;
+							};
 							let runtime = self.clone();
 							let ctx = ctx.clone();
 							let bundle = bundle.clone();
 							let reader = Arc::clone(&execution_gate).read_owned().await;
 							queries.spawn(async move {
+								let _query_slot = query_slot;
 								let _reader = reader;
 								let result = runtime.invoke_query(&ctx, &bundle, name, args).await;
 								reply.send(result);
@@ -553,6 +606,9 @@ impl WonderfulWasmtimeActorFactory {
 					reply.send(Ok(()));
 				}
 				ActorEvent::ConnectionClosed { conn } => {
+					if request_connections.remove(conn.id()) {
+						continue;
+					}
 					let _writer = execution_gate.write().await;
 					match self
 						.invoke_socket_lifecycle(
@@ -569,6 +625,10 @@ impl WonderfulWasmtimeActorFactory {
 						ActionOutcome::Reply(Ok(_)) => effect_notify.notify_one(),
 						ActionOutcome::Reply(Err(error)) => {
 							tracing::warn!(connection_id = %conn.id(), ?error, "Wonderful Cell socket close handler failed");
+						}
+						ActionOutcome::DestroyReply(_) => {
+							ctx.submit_fenced_destroy()?;
+							effect_notify.notify_one();
 						}
 						ActionOutcome::Fence(error) => {
 							queries.abort_all();
@@ -593,10 +653,28 @@ impl WonderfulWasmtimeActorFactory {
 						"queues are not supported by the transactional Cell runtime"
 					)));
 				}
-				ActorEvent::ConnectionPreflight { reply, .. } => reply.send(Ok(())),
+				ActorEvent::ConnectionPreflight {
+					conn,
+					protocol,
+					reply,
+					..
+				} => match protocol {
+					ConnectionProtocol::ActorConnect => reply.send(Ok(())),
+					ConnectionProtocol::Request => {
+						request_connections.insert(conn.id().to_owned());
+						reply.send(Ok(()));
+					}
+					ConnectionProtocol::RawWebSocket => reply.send(Err(anyhow!(
+						"raw WebSockets are not supported by the transactional Cell runtime"
+					))),
+				},
 				ActorEvent::ConnectionOpen {
 					conn, mut reply, ..
 				} => {
+					if request_connections.contains(conn.id()) {
+						reply.send(Ok(()));
+						continue;
+					}
 					let _writer = execution_gate.write().await;
 					let cancellation = CancellationToken::new();
 					let mut lifecycle = Box::pin(self.invoke_socket_lifecycle(
@@ -613,13 +691,18 @@ impl WonderfulWasmtimeActorFactory {
 						_ = reply.closed() => {
 							cancellation.cancel();
 							let outcome = lifecycle.await;
-							if let ActionOutcome::Fence(error) = outcome {
-								queries.abort_all();
-								effect_cancel.cancel();
-								if let Some(handle) = effect_handle.take() {
-									let _ = handle.await;
+							match outcome {
+								ActionOutcome::Fence(error) => {
+									queries.abort_all();
+									effect_cancel.cancel();
+									if let Some(handle) = effect_handle.take() {
+										let _ = handle.await;
+									}
+									return Err(error);
 								}
-								return Err(error);
+								ActionOutcome::DestroyReply(_) => ctx.submit_fenced_destroy()?,
+								ActionOutcome::Reply(Ok(_)) => effect_notify.notify_one(),
+								ActionOutcome::Reply(Err(_)) => {}
 							}
 							continue;
 						}
@@ -628,6 +711,11 @@ impl WonderfulWasmtimeActorFactory {
 					match outcome {
 						ActionOutcome::Reply(result) => {
 							reply.send(result.map(|_| ()));
+							effect_notify.notify_one();
+						}
+						ActionOutcome::DestroyReply(_) => {
+							reply.send(Ok(()));
+							ctx.submit_fenced_destroy()?;
 							effect_notify.notify_one();
 						}
 						ActionOutcome::Fence(error) => {
@@ -769,6 +857,10 @@ impl WonderfulWasmtimeActorFactory {
 			.await
 		{
 			Ok(admission) => admission,
+			Err(error) if is_remote_sqlite_indeterminate(&error) => {
+				*resident = None;
+				return ActionOutcome::Fence(error);
+			}
 			Err(error) => return ActionOutcome::Reply(Err(error)),
 		};
 		let operation = match admission {
@@ -842,9 +934,35 @@ impl WonderfulWasmtimeActorFactory {
 					)
 					.await;
 				}
-				let (mut connection_deltas, mut effects) =
-					match prepare_effects(ctx, bundle, output.effects) {
-						Ok(prepared) => prepared,
+				let operation_id = operation.request().operation_id.clone();
+				let (mut connection_deltas, mut effects) = match prepare_effects(
+					ctx,
+					bundle,
+					&operation_id,
+					self.actor_config.max_outgoing_message_size,
+					output.effects,
+				) {
+					Ok(prepared) => prepared,
+					Err(error) => {
+						*resident = None;
+						return fail_operation(
+							operation,
+							error,
+							completion_timestamp(envelope.started_at),
+						)
+						.await;
+					}
+				};
+				if output.destroyed {
+					effects.push(TransactionalEffect {
+						kind: DESTROY_EFFECT.to_owned(),
+						payload: Vec::new(),
+					});
+				}
+				if !effects.is_empty() && !output.destroyed {
+					let pending_operations = match operation.pending_effect_operation_count().await
+					{
+						Ok(count) => count,
 						Err(error) => {
 							*resident = None;
 							return fail_operation(
@@ -855,15 +973,41 @@ impl WonderfulWasmtimeActorFactory {
 							.await;
 						}
 					};
-				if output.destroyed {
-					effects.push(TransactionalEffect {
-						kind: DESTROY_EFFECT.to_owned(),
-						payload: Vec::new(),
-					});
+					if let Err(error) = validate_effect_backlog(
+						pending_operations,
+						self.limits.max_transactional_operations,
+					) {
+						*resident = None;
+						return fail_operation(
+							operation,
+							error,
+							completion_timestamp(envelope.started_at),
+						)
+						.await;
+					}
+				}
+				if let Err(error) = stage_schedule_effects(&operation, &effects).await {
+					*resident = None;
+					return fail_operation(
+						operation,
+						error,
+						completion_timestamp(envelope.started_at),
+					)
+					.await;
 				}
 				let result = output.result.clone();
 				let mut deltas = vec![StateDelta::ActorState(output.state)];
 				deltas.append(&mut connection_deltas);
+				if cancellation.is_some_and(CancellationToken::is_cancelled) {
+					*resident = None;
+					return fail_operation(
+						operation,
+						anyhow!("CELL_CONNECTION_SETUP_EXPIRED: connection setup reply expired"),
+						completion_timestamp(envelope.started_at),
+					)
+					.await;
+				}
+				let destroy_requested = output.destroyed;
 				match operation
 					.commit(
 						deltas,
@@ -873,6 +1017,17 @@ impl WonderfulWasmtimeActorFactory {
 					)
 					.await
 				{
+					Ok(_) if destroy_requested => {
+						if !ctx.is_destroy_requested() {
+							if let Err(error) = ctx.fence_destroy() {
+								*resident = None;
+								return ActionOutcome::Fence(
+									error.context("fence committed Cell destruction"),
+								);
+							}
+						}
+						ActionOutcome::DestroyReply(result)
+					}
 					Ok(_) => ActionOutcome::Reply(Ok(result)),
 					Err(error) => {
 						*resident = None;
@@ -891,29 +1046,54 @@ impl WonderfulWasmtimeActorFactory {
 		ctx: rivetkit_core::ActorContext,
 		notify: Arc<Notify>,
 		cancel: CancellationToken,
+		execution_gate: Arc<RwLock<()>>,
+		max_transactional_operations: u32,
 	) {
 		loop {
 			tokio::select! {
 				_ = cancel.cancelled() => return,
 				_ = notify.notified() => {}
 			}
-			loop {
-				let result = tokio::select! {
-					_ = cancel.cancelled() => return,
-					result = Self::deliver_pending_effect_batch(&ctx) => result,
-				};
-				match result {
-					Ok((_, true)) => return,
-					Ok((0, false)) => break,
-					Ok((_, false)) => {}
-					Err(error) => {
-						tracing::warn!(actor_id = %ctx.actor_id(), ?error, "Wonderful Cell effect delivery failed");
-						tokio::select! {
-							_ = cancel.cancelled() => return,
-							_ = tokio::time::sleep(EFFECT_RETRY_DELAY) => {}
+			let should_stop = ctx
+				.internal_keep_awake(async {
+					loop {
+						if cancel.is_cancelled() {
+							return true;
+						}
+						// Once a delivery starts, drive its actor-local transaction to a
+						// terminal commit/rollback before observing cancellation. Dropping
+						// an in-flight remote transaction could outlive this generation.
+						let delivery = {
+							// Remote actor-local SQLite is one connection. Keep effect scans,
+							// delivery acknowledgements, and compaction out of command/query
+							// transactions by sharing the runtime's writer fence.
+							let _writer = execution_gate.write().await;
+							let delivery = Self::deliver_pending_effect_batch(&ctx).await;
+							if let Err(error) = ctx
+								.compact_transactional_operations(max_transactional_operations)
+								.await
+							{
+								tracing::warn!(actor_id = %ctx.actor_id(), ?error, "Wonderful Cell operation compaction failed");
+							}
+							delivery
+						};
+						match delivery {
+							Ok((_, true)) => return true,
+							Ok((0, false)) => return false,
+							Ok((_, false)) => {}
+							Err(error) => {
+								tracing::warn!(actor_id = %ctx.actor_id(), ?error, "Wonderful Cell effect delivery failed");
+								tokio::select! {
+									_ = cancel.cancelled() => return true,
+									_ = tokio::time::sleep(EFFECT_RETRY_DELAY) => {}
+								}
+							}
 						}
 					}
-				}
+				})
+				.await;
+			if should_stop {
+				return;
 			}
 		}
 	}
@@ -952,17 +1132,20 @@ impl WonderfulWasmtimeActorFactory {
 		match effect.kind.as_str() {
 			SOCKET_SEND_EFFECT => {
 				let send = SocketSendEffect::decode(&effect.payload)?;
-				if let Some(connection) = ctx
-					.conns()
-					.find(|connection| connection.id() == send.connection_id)
-				{
+				let connection = {
+					ctx.conns()
+						.find(|connection| connection.id() == send.connection_id)
+				};
+				if let Some(connection) = connection {
 					let payload = SocketDeliveryEnvelope {
 						operation_id: effect.operation_id.clone(),
 						effect_index: effect.effect_index,
 						payload: send.payload,
 					}
 					.encode()?;
-					connection.send_checked(SOCKET_DELIVERY_EVENT, &payload)?;
+					connection
+						.send_admitted(SOCKET_DELIVERY_EVENT, &payload)
+						.await?;
 				}
 				ctx.mark_transactional_effect_delivered(
 					&effect.operation_id,
@@ -988,7 +1171,9 @@ impl WonderfulWasmtimeActorFactory {
 				}
 				.encode()?;
 				for connection in connections {
-					connection.send_checked(SOCKET_DELIVERY_EVENT, &payload)?;
+					connection
+						.send_admitted(SOCKET_DELIVERY_EVENT, &payload)
+						.await?;
 				}
 				ctx.mark_transactional_effect_delivered(
 					&effect.operation_id,
@@ -1015,31 +1200,18 @@ impl WonderfulWasmtimeActorFactory {
 			SCHEDULE_AT_EFFECT => {
 				let schedule = ScheduleAtEffect::decode(&effect.payload)?;
 				validate_schedule_id(&schedule.schedule_id)?;
-				let event_id = schedule_event_id(&schedule.schedule_id);
-				let args = CellActionEnvelope {
-					mode: CellMethodMode::Command,
-					operation_id: schedule_operation_id(&effect.operation_id, effect.effect_index),
-					input: schedule.input,
-					started_at: schedule.timestamp_ms,
-				}
-				.encode()?;
-				ctx.apply_transactional_schedule_upsert(
+				ctx.acknowledge_transactional_schedule_change(
 					&effect.operation_id,
 					effect.effect_index,
 					attempted_at,
-					TransactionalScheduleUpsert {
-						event_id: &event_id,
-						trigger_at: schedule.timestamp_ms,
-						action: &schedule.method,
-						args: &args,
-					},
+					&schedule_event_id(&schedule.schedule_id),
 				)
 				.await?;
 			}
 			SCHEDULE_CANCEL_EFFECT => {
 				let schedule = ScheduleCancelEffect::decode(&effect.payload)?;
 				validate_schedule_id(&schedule.schedule_id)?;
-				ctx.apply_transactional_schedule_cancel(
+				ctx.acknowledge_transactional_schedule_change(
 					&effect.operation_id,
 					effect.effect_index,
 					attempted_at,
@@ -1048,13 +1220,12 @@ impl WonderfulWasmtimeActorFactory {
 				.await?;
 			}
 			DESTROY_EFFECT => {
-				ctx.destroy()?;
-				ctx.mark_transactional_effect_delivered(
-					&effect.operation_id,
-					effect.effect_index,
-					attempted_at,
-				)
-				.await?;
+				if !ctx.is_destroy_requested() {
+					ctx.destroy()?;
+				}
+				// Deliberately leave the durable effect pending. ActorIntent::Stop is
+				// fire-and-forget, so deleting the intent here would create a crash
+				// window before the engine observes the destruction request.
 			}
 			kind => bail!("unsupported Wonderful Cell effect kind {kind}"),
 		}
@@ -1168,9 +1339,15 @@ fn schedule_operation_id(operation_id: &str, effect_index: u32) -> String {
 	encoded
 }
 
+fn is_remote_sqlite_indeterminate(error: &anyhow::Error) -> bool {
+	let error = RivetError::extract(error);
+	error.group() == "sqlite" && error.code() == "remote_indeterminate_result"
+}
+
 #[derive(Debug)]
 enum ActionOutcome {
 	Reply(Result<Vec<u8>>),
+	DestroyReply(Vec<u8>),
 	Fence(anyhow::Error),
 }
 
@@ -1241,6 +1418,13 @@ struct CellGuestInvocationError {
 }
 
 impl CellGuestInvocationError {
+	fn bounded_guest_error(code: String, message: String) -> Self {
+		Self {
+			code: code.chars().take(64).collect(),
+			message: message.chars().take(4096).collect(),
+		}
+	}
+
 	fn durable_failure(&self) -> (String, String) {
 		let code = if !self.code.is_empty()
 			&& self.code.len() <= 64
@@ -1282,6 +1466,7 @@ struct HostState {
 	limits: StoreLimits,
 	sql_capability: SqlCapability,
 	query_mutation_violation: bool,
+	sql_policy_violation: bool,
 	sql_limit_violation: bool,
 	runtime_limits: WonderfulWasmtimeLimits,
 	wasi: WasiCtx,
@@ -1307,6 +1492,15 @@ impl bindings::wonderful::cells::host::Host for HostState {
 			.into_iter()
 			.map(bind_param_from_guest)
 			.collect::<Vec<_>>();
+		if let Err(error) = validate_guest_sql(&sql, &params, &self.runtime_limits) {
+			self.sql_policy_violation = true;
+			return Err(format!("CELL_SQL_POLICY_VIOLATION: {error}"));
+		}
+		let sql = sql_with_result_limits(
+			sql,
+			self.runtime_limits.max_sql_rows,
+			self.runtime_limits.max_sql_result_bytes,
+		);
 		let result = match &self.sql_capability {
 			SqlCapability::Transactional(active) => {
 				let guard = active.lock().await;
@@ -1343,16 +1537,16 @@ impl bindings::wonderful::cells::host::Host for HostState {
 	}
 }
 
-fn validate_read_only_sql(
+fn validate_guest_sql(
 	sql: &str,
 	params: &[BindParam],
 	limits: &WonderfulWasmtimeLimits,
 ) -> Result<()> {
 	if sql.len() > limits.max_sql_bytes {
-		bail!("query SQL exceeds configured size limit");
+		bail!("Cell SQL exceeds configured size limit");
 	}
 	if params.len() > limits.max_sql_params {
-		bail!("query SQL exceeds configured parameter count");
+		bail!("Cell SQL exceeds configured parameter count");
 	}
 	let parameter_bytes = params
 		.iter()
@@ -1364,15 +1558,26 @@ fn validate_read_only_sql(
 		})
 		.fold(0usize, usize::saturating_add);
 	if parameter_bytes > limits.max_sql_param_bytes {
-		bail!("query SQL exceeds configured parameter bytes");
+		bail!("Cell SQL exceeds configured parameter bytes");
 	}
 	let mut offset = 0;
-	let first = next_sql_keyword(sql, &mut offset).context("query SQL is empty")?;
-	if !first.eq_ignore_ascii_case("SELECT") {
-		bail!("only SELECT statements are available to Cell queries");
-	}
-	if sql.contains(';') {
-		bail!("multiple or terminated SQL statements are unavailable to Cell queries");
+	let first = next_sql_keyword(sql, &mut offset).context("Cell SQL is empty")?;
+	if [
+		"BEGIN",
+		"COMMIT",
+		"END",
+		"ROLLBACK",
+		"SAVEPOINT",
+		"RELEASE",
+		"ATTACH",
+		"DETACH",
+		"PRAGMA",
+		"VACUUM",
+	]
+	.iter()
+	.any(|denied| first.eq_ignore_ascii_case(denied))
+	{
+		bail!("transaction and database-control SQL is unavailable to Cells");
 	}
 	let normalized = sql.to_ascii_lowercase();
 	if [
@@ -1386,9 +1591,29 @@ fn validate_read_only_sql(
 	.iter()
 	.any(|denied| normalized.contains(denied))
 	{
-		bail!("internal tables and side-effecting functions are unavailable to Cell queries");
+		bail!("Rivet runtime storage and side-effecting SQL extensions are unavailable to Cells");
 	}
 	Ok(())
+}
+
+fn validate_read_only_sql(
+	sql: &str,
+	_params: &[BindParam],
+	_limits: &WonderfulWasmtimeLimits,
+) -> Result<()> {
+	let mut offset = 0;
+	let first = next_sql_keyword(sql, &mut offset).context("query SQL is empty")?;
+	if !first.eq_ignore_ascii_case("SELECT") {
+		bail!("only SELECT statements are available to Cell queries");
+	}
+	if sql.contains(';') {
+		bail!("multiple or terminated SQL statements are unavailable to Cell queries");
+	}
+	Ok(())
+}
+
+fn sql_with_result_limits(sql: String, max_rows: usize, max_bytes: usize) -> String {
+	format!("/*rivet-result-limits:{max_rows}:{max_bytes}*/{sql}")
 }
 
 fn validate_sql_result(
@@ -1506,6 +1731,9 @@ impl Resident {
 		let store_limits = StoreLimitsBuilder::new()
 			.memory_size(limits.max_linear_memory_bytes)
 			.instances(limits.max_component_instances)
+			.memories(limits.max_component_memories)
+			.tables(limits.max_component_tables)
+			.table_elements(limits.max_table_elements)
 			.build();
 		let mut store = Store::new(
 			&engine,
@@ -1513,6 +1741,7 @@ impl Resident {
 				limits: store_limits,
 				sql_capability: SqlCapability::Unavailable,
 				query_mutation_violation: false,
+				sql_policy_violation: false,
 				sql_limit_violation: false,
 				runtime_limits: limits.clone(),
 				wasi: WasiCtx::builder().build(),
@@ -1563,6 +1792,7 @@ impl Resident {
 		self.store.set_fuel(self.limits.fuel_per_command)?;
 		self.store.data_mut().sql_capability = sql_capability;
 		self.store.data_mut().query_mutation_violation = false;
+		self.store.data_mut().sql_policy_violation = false;
 		self.store.data_mut().sql_limit_violation = false;
 		let invocation = tokio::time::timeout(
 			self.limits.command_timeout,
@@ -1572,12 +1802,20 @@ impl Resident {
 		)
 		.await;
 		let query_mutation_violation = self.store.data().query_mutation_violation;
+		let sql_policy_violation = self.store.data().sql_policy_violation;
 		let sql_limit_violation = self.store.data().sql_limit_violation;
 		self.store.data_mut().sql_capability = SqlCapability::Unavailable;
 		if query_mutation_violation {
 			return Err(CellGuestInvocationError {
 				code: "CELL_QUERY_MUTATION_VIOLATION".to_owned(),
 				message: "Cell query attempted to execute mutable SQL".to_owned(),
+			}
+			.into());
+		}
+		if sql_policy_violation {
+			return Err(CellGuestInvocationError {
+				code: "CELL_SQL_POLICY_VIOLATION".to_owned(),
+				message: "Cell SQL violated the runtime storage policy".to_owned(),
 			}
 			.into());
 		}
@@ -1596,9 +1834,8 @@ impl Resident {
 			code: "CELL_GUEST_TRAP".to_owned(),
 			message: "Cell guest execution trapped".to_owned(),
 		})?;
-		let output = invocation.map_err(|error| CellGuestInvocationError {
-			code: error.code,
-			message: error.message,
+		let output = invocation.map_err(|error| {
+			CellGuestInvocationError::bounded_guest_error(error.code, error.message)
 		})?;
 		Ok(GuestOutput {
 			state: output.state,
@@ -1616,9 +1853,50 @@ impl Resident {
 	}
 }
 
+async fn stage_schedule_effects(
+	operation: &TransactionalOperation,
+	effects: &[TransactionalEffect],
+) -> Result<()> {
+	for (effect_index, effect) in effects.iter().enumerate() {
+		match effect.kind.as_str() {
+			SCHEDULE_AT_EFFECT => {
+				let schedule = ScheduleAtEffect::decode(&effect.payload)?;
+				let args = CellActionEnvelope {
+					mode: CellMethodMode::Command,
+					operation_id: schedule_operation_id(
+						&operation.request().operation_id,
+						u32::try_from(effect_index).context("schedule effect index exceeds u32")?,
+					),
+					input: schedule.input,
+					started_at: schedule.timestamp_ms,
+				}
+				.encode()?;
+				operation
+					.stage_schedule_upsert(TransactionalScheduleUpsert {
+						event_id: &schedule_event_id(&schedule.schedule_id),
+						trigger_at: schedule.timestamp_ms,
+						action: &schedule.method,
+						args: &args,
+					})
+					.await?;
+			}
+			SCHEDULE_CANCEL_EFFECT => {
+				let schedule = ScheduleCancelEffect::decode(&effect.payload)?;
+				operation
+					.stage_schedule_cancel(&schedule_event_id(&schedule.schedule_id))
+					.await?;
+			}
+			_ => {}
+		}
+	}
+	Ok(())
+}
+
 fn prepare_effects(
 	ctx: &rivetkit_core::ActorContext,
 	bundle: &CellBundle,
+	operation_id: &str,
+	max_outgoing_message_size: u32,
 	effects: Vec<GuestEffect>,
 ) -> Result<(Vec<StateDelta>, Vec<TransactionalEffect>)> {
 	let mut deltas = Vec::new();
@@ -1637,6 +1915,12 @@ fn prepare_effects(
 			SOCKET_SEND_EFFECT => {
 				let send = SocketSendEffect::decode(&effect.payload)?;
 				validate_connection_id(&send.connection_id)?;
+				validate_socket_delivery_size(
+					operation_id,
+					durable.len(),
+					&send.payload,
+					max_outgoing_message_size,
+				)?;
 				durable.push(TransactionalEffect {
 					kind: effect.kind,
 					payload: effect.payload,
@@ -1651,6 +1935,12 @@ fn prepare_effects(
 				for connection_id in &broadcast.exclude_connection_ids {
 					validate_connection_id(connection_id)?;
 				}
+				validate_socket_delivery_size(
+					operation_id,
+					durable.len(),
+					&broadcast.payload,
+					max_outgoing_message_size,
+				)?;
 				durable.push(TransactionalEffect {
 					kind: effect.kind,
 					payload: effect.payload,
@@ -1703,6 +1993,43 @@ fn prepare_effects(
 	Ok((deltas, durable))
 }
 
+fn validate_socket_delivery_size(
+	operation_id: &str,
+	effect_index: usize,
+	payload: &[u8],
+	max_outgoing_message_size: u32,
+) -> Result<()> {
+	let effect_index = u32::try_from(effect_index).context("Cell effect index exceeds u32")?;
+	let envelope = SocketDeliveryEnvelope {
+		operation_id: operation_id.to_owned(),
+		effect_index,
+		payload: payload.to_vec(),
+	}
+	.encode()?;
+	// Reserve space for the actor-connect event wrapper. Cells use BARE in
+	// production, but the margin also fails closed if another encoding adds
+	// modest framing overhead.
+	let framed_size = envelope
+		.len()
+		.saturating_add(SOCKET_DELIVERY_EVENT.len())
+		.saturating_add(1024);
+	if framed_size > max_outgoing_message_size as usize {
+		bail!("Cell socket effect exceeds the configured outgoing message limit");
+	}
+	Ok(())
+}
+
+fn validate_effect_backlog(pending_operations: u64, maximum: u32) -> Result<()> {
+	if pending_operations >= u64::from(maximum) {
+		return Err(CellGuestInvocationError {
+			code: "CELL_EFFECT_BACKLOG_LIMIT".to_owned(),
+			message: "Cell effect backlog reached its configured limit".to_owned(),
+		}
+		.into());
+	}
+	Ok(())
+}
+
 fn validate_output(output: &GuestOutput, limits: &WonderfulWasmtimeLimits) -> Result<()> {
 	if output.state.len() > limits.max_state_bytes {
 		bail!("Cell state exceeds configured output limit");
@@ -1716,9 +2043,24 @@ fn validate_output(output: &GuestOutput, limits: &WonderfulWasmtimeLimits) -> Re
 	if output
 		.effects
 		.iter()
+		.any(|effect| effect.kind.len() > limits.max_effect_kind_bytes)
+	{
+		bail!("Cell effect kind exceeds configured output limit");
+	}
+	if output
+		.effects
+		.iter()
 		.any(|effect| effect.payload.len() > limits.max_effect_bytes)
 	{
 		bail!("Cell effect exceeds configured payload limit");
+	}
+	let total_effect_bytes = output.effects.iter().fold(0usize, |total, effect| {
+		total
+			.saturating_add(effect.kind.len())
+			.saturating_add(effect.payload.len())
+	});
+	if total_effect_bytes > limits.max_total_effect_bytes {
+		bail!("Cell aggregate effects exceed configured output limit");
 	}
 	Ok(())
 }
@@ -1733,7 +2075,7 @@ mod tests {
 	fn test_bundle() -> CellBundle {
 		CellBundle::verified(
 			b"test bundle".to_vec(),
-			br#"{"formatVersion":1,"methods":{"echo":"command","fail":"command","sql":"command","spin":"command","schedule":"command","read":"query","read_sql":"query","mutating_query":"query"}}"#.to_vec(),
+			br#"{"formatVersion":1,"methods":{"echo":"command","fail":"command","sql":"command","spin":"command","schedule":"command","send":"command","destroy":"command","read":"query","read_sql":"query","mutating_query":"query"}}"#.to_vec(),
 		)
 	}
 
@@ -1752,12 +2094,10 @@ mod tests {
 		.expect("create test Wasmtime runtime")
 	}
 
-	async fn commit_test_effect(
+	async fn begin_test_operation(
 		ctx: &rivetkit_core::ActorContext,
 		operation_id: &str,
-		kind: &str,
-		payload: Vec<u8>,
-	) {
+	) -> TransactionalOperation {
 		let admission = ctx
 			.begin_transactional_operation(
 				TransactionalOperationRequest {
@@ -1776,6 +2116,16 @@ mod tests {
 			panic!("test effect operation must be new");
 		};
 		operation
+	}
+
+	async fn commit_test_effect(
+		ctx: &rivetkit_core::ActorContext,
+		operation_id: &str,
+		kind: &str,
+		payload: Vec<u8>,
+	) {
+		begin_test_operation(ctx, operation_id)
+			.await
 			.commit(
 				vec![StateDelta::ActorState(ctx.state())],
 				Vec::new(),
@@ -1968,6 +2318,73 @@ mod tests {
 			.expect("actor adapter exits cleanly");
 	}
 
+	#[tokio::test]
+	async fn committed_destruction_fences_before_reply_and_remains_durable() {
+		use rivetkit_core::{ActorEvents, Reply, testing};
+		use tokio::sync::{mpsc, oneshot};
+
+		let runtime = test_runtime();
+		let ctx = testing::actor_context("cell-destroy", "cell", Vec::new(), "local");
+		let (event_tx, event_rx) = mpsc::unbounded_channel();
+		let (ready_tx, ready_rx) = oneshot::channel();
+		let run = tokio::spawn({
+			let runtime = runtime.clone();
+			let ctx = ctx.clone();
+			async move {
+				runtime
+					.run_actor(ActorStart {
+						ctx,
+						input: None,
+						is_new: false,
+						snapshot: Some(Vec::new()),
+						hibernated: Vec::new(),
+						events: ActorEvents::from(event_rx),
+						startup_ready: Some(ready_tx),
+					})
+					.await
+			}
+		});
+		ready_rx
+			.await
+			.expect("startup ready reply")
+			.expect("Cell startup succeeds");
+
+		let envelope = CellActionEnvelope {
+			operation_id: "operation-destroy".to_owned(),
+			input: vec![7],
+			started_at: 100,
+			mode: CellMethodMode::Command,
+		};
+		let (reply_tx, reply_rx) = oneshot::channel();
+		event_tx
+			.send(ActorEvent::Action {
+				name: "destroy".to_owned(),
+				args: envelope.encode().expect("encode action envelope"),
+				conn: None,
+				scheduled_fire: None,
+				reply: Reply::from(reply_tx),
+			})
+			.expect("send destroy action");
+		assert_eq!(
+			reply_rx
+				.await
+				.expect("destroy reply")
+				.expect("destroy succeeds"),
+			vec![7],
+		);
+		assert!(ctx.is_destroy_requested());
+		assert!(
+			ctx.has_pending_transactional_effect_kind(DESTROY_EFFECT)
+				.await
+				.expect("load destruction intent")
+		);
+
+		drop(event_tx);
+		run.await
+			.expect("join actor adapter")
+			.expect("actor adapter exits cleanly");
+	}
+
 	#[test]
 	fn scheduled_effects_require_versioned_declared_commands() {
 		let ctx = rivetkit_core::testing::actor_context(
@@ -1992,10 +2409,46 @@ mod tests {
 				payload,
 			}
 		};
-		assert!(prepare_effects(&ctx, &test_bundle(), vec![effect(2, "echo")]).is_err());
-		assert!(prepare_effects(&ctx, &test_bundle(), vec![effect(1, "read")]).is_err());
-		assert!(prepare_effects(&ctx, &test_bundle(), vec![effect(1, "missing")]).is_err());
-		assert!(prepare_effects(&ctx, &test_bundle(), vec![effect(1, "echo")]).is_ok());
+		assert!(
+			prepare_effects(
+				&ctx,
+				&test_bundle(),
+				"test",
+				u32::MAX,
+				vec![effect(2, "echo")]
+			)
+			.is_err()
+		);
+		assert!(
+			prepare_effects(
+				&ctx,
+				&test_bundle(),
+				"test",
+				u32::MAX,
+				vec![effect(1, "read")]
+			)
+			.is_err()
+		);
+		assert!(
+			prepare_effects(
+				&ctx,
+				&test_bundle(),
+				"test",
+				u32::MAX,
+				vec![effect(1, "missing")],
+			)
+			.is_err()
+		);
+		assert!(
+			prepare_effects(
+				&ctx,
+				&test_bundle(),
+				"test",
+				u32::MAX,
+				vec![effect(1, "echo")]
+			)
+			.is_ok()
+		);
 	}
 
 	#[tokio::test]
@@ -2007,7 +2460,7 @@ mod tests {
 		let ctx = testing::actor_context("cell-effect-pump", "cell", Vec::new(), "local");
 		let (event_tx, event_rx) = mpsc::unbounded_channel();
 		let (ready_tx, ready_rx) = oneshot::channel();
-		let run = tokio::spawn({
+		let mut run = tokio::spawn({
 			let runtime = runtime.clone();
 			let ctx = ctx.clone();
 			async move {
@@ -2045,10 +2498,11 @@ mod tests {
 				reply: Reply::from(reply_tx),
 			})
 			.expect("send schedule command");
-		reply_rx
-			.await
-			.expect("command reply")
-			.expect("schedule command succeeds");
+		let command_reply = tokio::select! {
+			reply = reply_rx => reply.expect("command reply"),
+			result = &mut run => panic!("actor adapter exited during schedule command: {result:?}"),
+		};
+		command_reply.expect("schedule command succeeds");
 		tokio::time::timeout(Duration::from_secs(1), async {
 			loop {
 				if ctx
@@ -2107,6 +2561,68 @@ mod tests {
 			.await
 			.expect("startup ready reply")
 			.expect("Cell startup succeeds");
+
+		let (raw_reply_tx, raw_reply_rx) = oneshot::channel();
+		event_tx
+			.send(ActorEvent::ConnectionPreflight {
+				conn: connection.clone(),
+				protocol: ConnectionProtocol::RawWebSocket,
+				params: Vec::new(),
+				request: None,
+				reply: Reply::from(raw_reply_tx),
+			})
+			.expect("send raw websocket preflight");
+		assert!(raw_reply_rx.await.expect("raw preflight reply").is_err());
+
+		let (request_connection, _events) =
+			testing::add_connection(&ctx, "request-connection", false);
+		let (request_preflight_tx, request_preflight_rx) = oneshot::channel();
+		event_tx
+			.send(ActorEvent::ConnectionPreflight {
+				conn: request_connection.clone(),
+				protocol: ConnectionProtocol::Request,
+				params: Vec::new(),
+				request: None,
+				reply: Reply::from(request_preflight_tx),
+			})
+			.expect("send request preflight");
+		request_preflight_rx
+			.await
+			.expect("request preflight reply")
+			.expect("request preflight succeeds");
+		let (request_open_tx, request_open_rx) = oneshot::channel();
+		event_tx
+			.send(ActorEvent::ConnectionOpen {
+				conn: request_connection.clone(),
+				request: None,
+				reply: Reply::from(request_open_tx),
+			})
+			.expect("send request connection open");
+		request_open_rx
+			.await
+			.expect("request connection open reply")
+			.expect("request connection open succeeds");
+		event_tx
+			.send(ActorEvent::ConnectionClosed {
+				conn: request_connection,
+			})
+			.expect("send request connection close");
+
+		let (managed_reply_tx, managed_reply_rx) = oneshot::channel();
+		event_tx
+			.send(ActorEvent::ConnectionPreflight {
+				conn: connection.clone(),
+				protocol: ConnectionProtocol::ActorConnect,
+				params: Vec::new(),
+				request: None,
+				reply: Reply::from(managed_reply_tx),
+			})
+			.expect("send managed websocket preflight");
+		managed_reply_rx
+			.await
+			.expect("managed preflight reply")
+			.expect("managed preflight succeeds");
+
 		let (reply_tx, reply_rx) = oneshot::channel();
 		event_tx
 			.send(ActorEvent::ConnectionOpen {
@@ -2127,6 +2643,24 @@ mod tests {
 				.expect("connection operation exists")
 				.status,
 			TransactionalOperationStatus::Succeeded
+		);
+		assert!(
+			ctx.transactional_operation(&format!(
+				"socket:1:{SOCKET_CONNECT_METHOD}:request-connection"
+			))
+			.await
+			.expect("load request open operation")
+			.is_none(),
+			"framework request connections must not invoke Cell socket lifecycle methods"
+		);
+		assert!(
+			ctx.transactional_operation(&format!(
+				"socket:1:{SOCKET_CLOSE_METHOD}:request-connection"
+			))
+			.await
+			.expect("load request close operation")
+			.is_none(),
+			"framework request closes must not invoke Cell socket lifecycle methods"
 		);
 
 		let (expired_connection, _events) =
@@ -2204,6 +2738,8 @@ mod tests {
 		let (deltas, effects) = prepare_effects(
 			&ctx,
 			&test_bundle(),
+			"socket-state-operation",
+			u32::MAX,
 			vec![GuestEffect {
 				kind: SOCKET_STATE_EFFECT.to_owned(),
 				payload: SocketStateEffect {
@@ -2318,80 +2854,228 @@ mod tests {
 	}
 
 	#[tokio::test]
-	async fn schedule_effect_and_ack_commit_atomically_and_cancel_idempotently() {
+	async fn failing_head_effect_backpressures_new_effects_at_operation_bound() {
+		use rivetkit_core::{ActorEvents, Reply, testing};
+		use tokio::sync::{mpsc, oneshot};
+
+		let runtime = test_runtime_with_limits(WonderfulWasmtimeLimits {
+			max_transactional_operations: 0,
+			..WonderfulWasmtimeLimits::default()
+		});
+		let ctx = testing::actor_context("cell-effect-bound", "cell", Vec::new(), "local");
+		let (_connection, events) = testing::add_connection(&ctx, "blocked", true);
+		drop(events);
+		commit_test_effect(
+			&ctx,
+			"operation-blocked",
+			SOCKET_SEND_EFFECT,
+			SocketSendEffect {
+				connection_id: "blocked".to_owned(),
+				payload: vec![1],
+			}
+			.encode()
+			.expect("encode blocked effect"),
+		)
+		.await;
+
+		let (event_tx, event_rx) = mpsc::unbounded_channel();
+		let (ready_tx, ready_rx) = oneshot::channel();
+		let run = tokio::spawn({
+			let runtime = runtime.clone();
+			let ctx = ctx.clone();
+			async move {
+				runtime
+					.run_actor(ActorStart {
+						ctx,
+						input: None,
+						is_new: false,
+						snapshot: Some(Vec::new()),
+						hibernated: Vec::new(),
+						events: ActorEvents::from(event_rx),
+						startup_ready: Some(ready_tx),
+					})
+					.await
+			}
+		});
+		ready_rx
+			.await
+			.expect("startup ready reply")
+			.expect("Cell startup succeeds");
+		let (reply_tx, reply_rx) = oneshot::channel();
+		event_tx
+			.send(ActorEvent::Action {
+				name: "send".to_owned(),
+				args: CellActionEnvelope {
+					mode: CellMethodMode::Command,
+					operation_id: "operation-over-bound".to_owned(),
+					input: b"missing".to_vec(),
+					started_at: 1,
+				}
+				.encode()
+				.expect("encode action"),
+				conn: None,
+				scheduled_fire: None,
+				reply: Reply::from(reply_tx),
+			})
+			.expect("send effect-producing command");
+		let error = reply_rx
+			.await
+			.expect("command reply")
+			.expect_err("effect backlog must reject another effect-producing command");
+		assert!(format!("{error:#}").contains("CELL_EFFECT_BACKLOG_LIMIT"));
+
+		assert_eq!(
+			ctx.pending_transactional_effect_operation_count()
+				.await
+				.unwrap(),
+			1
+		);
+		tokio::time::timeout(Duration::from_secs(1), async {
+			while ctx
+				.transactional_operation("operation-over-bound")
+				.await
+				.expect("load compactable rejected operation")
+				.is_some()
+			{
+				tokio::task::yield_now().await;
+			}
+		})
+		.await
+		.expect("failed head must not prevent terminal-operation compaction");
+
+		drop(event_tx);
+		run.await
+			.expect("join bounded actor adapter")
+			.expect("bounded actor adapter exits cleanly");
+	}
+
+	#[tokio::test]
+	async fn schedule_reconciliation_never_replays_stale_mutations() {
 		let ctx = rivetkit_core::testing::actor_context(
 			"cell-schedule-effect",
 			"cell",
 			Vec::new(),
 			"local",
 		);
-		commit_test_effect(
-			&ctx,
-			"operation-schedule",
-			SCHEDULE_AT_EFFECT,
-			ScheduleAtEffect {
-				schedule_id: "daily-check".to_owned(),
-				timestamp_ms: 50_000,
-				method: "echo".to_owned(),
-				input: vec![7],
-			}
-			.encode()
-			.expect("encode schedule effect"),
-		)
-		.await;
-		WonderfulWasmtimeActorFactory::deliver_pending_effect_batch(&ctx)
+		let event_id = "wonderful:daily-check";
+		let old_payload = ScheduleAtEffect {
+			schedule_id: "daily-check".to_owned(),
+			timestamp_ms: 50_000,
+			method: "echo".to_owned(),
+			input: vec![7],
+		}
+		.encode()
+		.expect("encode schedule effect");
+		let old_args = CellActionEnvelope {
+			mode: CellMethodMode::Command,
+			operation_id: schedule_operation_id("operation-schedule", 0),
+			input: vec![7],
+			started_at: 50_000,
+		}
+		.encode()
+		.expect("encode old schedule action");
+		let old_operation = begin_test_operation(&ctx, "operation-schedule").await;
+		old_operation
+			.stage_schedule_upsert(TransactionalScheduleUpsert {
+				event_id,
+				trigger_at: 50_000,
+				action: "echo",
+				args: &old_args,
+			})
 			.await
-			.expect("deliver schedule effect");
-		let scheduled = ctx
-			.get_scheduled_event("wonderful:daily-check")
-			.await
-			.expect("load scheduled event")
-			.expect("scheduled event exists");
-		assert_eq!(scheduled.action, "echo");
-		let envelope =
-			CellActionEnvelope::decode(&scheduled.args).expect("decode scheduled command envelope");
-		assert_eq!(envelope.mode, CellMethodMode::Command);
-		assert_eq!(envelope.input, vec![7]);
-		assert_eq!(
-			envelope.operation_id,
-			schedule_operation_id("operation-schedule", 0)
-		);
-		assert!(
-			!ctx.apply_transactional_schedule_upsert(
-				"operation-schedule",
-				0,
-				3,
-				TransactionalScheduleUpsert {
-					event_id: "wonderful:daily-check",
-					trigger_at: 50_000,
-					action: "echo",
-					args: &scheduled.args,
-				},
+			.expect("stage old schedule");
+		old_operation
+			.commit(
+				Vec::new(),
+				Vec::new(),
+				vec![TransactionalEffect {
+					kind: SCHEDULE_AT_EFFECT.to_owned(),
+					payload: old_payload,
+				}],
+				2,
 			)
 			.await
-			.expect("redeliver acknowledged schedule")
-		);
+			.expect("commit old schedule aggregate");
 
-		commit_test_effect(
-			&ctx,
-			"operation-cancel",
-			SCHEDULE_CANCEL_EFFECT,
-			ScheduleCancelEffect {
-				schedule_id: "daily-check".to_owned(),
-			}
-			.encode()
-			.expect("encode cancellation effect"),
-		)
-		.await;
+		let replacement_args = b"replacement".to_vec();
+		let replacement = begin_test_operation(&ctx, "operation-replacement").await;
+		replacement
+			.stage_schedule_upsert(TransactionalScheduleUpsert {
+				event_id,
+				trigger_at: 60_000,
+				action: "replacement",
+				args: &replacement_args,
+			})
+			.await
+			.expect("stage replacement schedule");
+		replacement
+			.commit(Vec::new(), Vec::new(), Vec::new(), 3)
+			.await
+			.expect("commit replacement schedule");
+
 		WonderfulWasmtimeActorFactory::deliver_pending_effect_batch(&ctx)
 			.await
-			.expect("deliver cancellation effect");
+			.expect("reconcile old schedule effect");
+		let scheduled = ctx
+			.get_scheduled_event(event_id)
+			.await
+			.expect("load replacement schedule")
+			.expect("replacement schedule exists");
+		assert_eq!(scheduled.run_at, 60_000);
+		assert_eq!(scheduled.action, "replacement");
+		assert_eq!(scheduled.args, replacement_args);
 		assert!(
-			ctx.get_scheduled_event("wonderful:daily-check")
+			!ctx.acknowledge_transactional_schedule_change("operation-schedule", 0, 4, event_id,)
 				.await
-				.expect("load cancelled event")
-				.is_none()
+				.expect("redeliver acknowledged schedule reconciliation")
 		);
+
+		let cancellation = begin_test_operation(&ctx, "operation-cancel").await;
+		cancellation
+			.stage_schedule_cancel(event_id)
+			.await
+			.expect("stage schedule cancellation");
+		cancellation
+			.commit(
+				Vec::new(),
+				Vec::new(),
+				vec![TransactionalEffect {
+					kind: SCHEDULE_CANCEL_EFFECT.to_owned(),
+					payload: ScheduleCancelEffect {
+						schedule_id: "daily-check".to_owned(),
+					}
+					.encode()
+					.expect("encode cancellation effect"),
+				}],
+				5,
+			)
+			.await
+			.expect("commit cancellation aggregate");
+		let post_cancel_replacement = begin_test_operation(&ctx, "operation-post-cancel").await;
+		post_cancel_replacement
+			.stage_schedule_upsert(TransactionalScheduleUpsert {
+				event_id,
+				trigger_at: 70_000,
+				action: "post-cancel",
+				args: &[],
+			})
+			.await
+			.expect("stage post-cancel replacement");
+		post_cancel_replacement
+			.commit(Vec::new(), Vec::new(), Vec::new(), 6)
+			.await
+			.expect("commit post-cancel replacement");
+
+		WonderfulWasmtimeActorFactory::deliver_pending_effect_batch(&ctx)
+			.await
+			.expect("reconcile old cancellation effect");
+		let scheduled = ctx
+			.get_scheduled_event(event_id)
+			.await
+			.expect("load post-cancel replacement")
+			.expect("old cancellation must not delete replacement");
+		assert_eq!(scheduled.run_at, 70_000);
+		assert_eq!(scheduled.action, "post-cancel");
 	}
 
 	#[tokio::test]
@@ -2668,6 +3352,22 @@ mod tests {
 	}
 
 	#[test]
+	fn remote_sqlite_indeterminate_errors_require_resident_fencing() {
+		let error = anyhow!(RivetError {
+			kind: rivet_error::RivetErrorKind::Dynamic {
+				group: "sqlite".to_owned(),
+				code: "remote_indeterminate_result".to_owned(),
+				default_message: "indeterminate".to_owned(),
+			},
+			meta: None,
+			message: None,
+			actor: None,
+		});
+		assert!(is_remote_sqlite_indeterminate(&error));
+		assert!(!is_remote_sqlite_indeterminate(&anyhow!("unavailable")));
+	}
+
+	#[test]
 	fn runtime_manifest_requires_declared_versioned_methods() {
 		assert_eq!(
 			CellRuntimeManifest::decode(&test_bundle().manifest)
@@ -2685,28 +3385,65 @@ mod tests {
 	}
 
 	#[test]
-	fn query_sql_capability_accepts_only_bounded_public_selects() {
+	fn cell_sql_capability_accepts_only_bounded_public_storage() {
 		let limits = WonderfulWasmtimeLimits::default();
-		assert!(
-			validate_read_only_sql(
-				"/* comment */ -- comment\n SELECT value FROM test_values WHERE value = ?",
-				&[BindParam::Blob(vec![1])],
-				&limits,
-			)
-			.is_ok()
-		);
+		let public_select =
+			"/* comment */ -- comment\n SELECT value FROM test_values WHERE value = ?";
+		let params = [BindParam::Blob(vec![1])];
+		assert!(validate_guest_sql(public_select, &params, &limits).is_ok());
+		assert!(validate_read_only_sql(public_select, &params, &limits).is_ok());
+
+		for sql in [
+			"SELECT * FROM _rivet_operations",
+			"SELECT * FROM SQLITE_SCHEMA",
+			"CREATE VIEW leaked AS SELECT * FROM `_RiVeT_OpErAtIoNs`",
+			"SELECT load_extension('guest-extension')",
+			"/* hide */ COMMIT",
+			"-- hide\nROLLBACK",
+			"BEGIN IMMEDIATE",
+			"END TRANSACTION",
+			"SAVEPOINT guest",
+			"RELEASE guest",
+			"ATTACH DATABASE ':memory:' AS escape",
+			"DETACH DATABASE escape",
+			"PRAGMA writable_schema = 1",
+			"VACUUM INTO '/tmp/escape.db'",
+		] {
+			assert!(validate_guest_sql(sql, &[], &limits).is_err(), "{sql}");
+		}
 		for sql in [
 			"INSERT INTO test_values VALUES (1)",
 			"WITH value AS (SELECT 1) SELECT * FROM value",
-			"SELECT * FROM _rivet_operations",
 			"SELECT 1; SELECT 2",
 		] {
 			assert!(validate_read_only_sql(sql, &[], &limits).is_err(), "{sql}");
 		}
+
+		let small = WonderfulWasmtimeLimits {
+			max_sql_bytes: 8,
+			max_sql_params: 1,
+			max_sql_param_bytes: 1,
+			..limits
+		};
+		assert!(validate_guest_sql("SELECT 10", &[], &small).is_err());
+		assert!(
+			validate_guest_sql(
+				"SELECT ?",
+				&[BindParam::Integer(1), BindParam::Integer(2)],
+				&small
+			)
+			.is_err()
+		);
+		assert!(validate_guest_sql("SELECT ?", &[BindParam::Blob(vec![1, 2])], &small).is_err());
 	}
 
 	#[test]
 	fn bundle_digest_and_output_limits_fail_closed() {
+		assert!(validate_effect_backlog(0, 1).is_ok());
+		assert!(
+			format!("{:#}", validate_effect_backlog(1, 1).unwrap_err())
+				.contains("CELL_EFFECT_BACKLOG_LIMIT")
+		);
 		let runtime = test_runtime();
 		let mut bundle = CellBundle::verified(vec![1], Vec::new());
 		bundle.bundle_sha256 = [0; 32];
@@ -2723,5 +3460,26 @@ mod tests {
 			destroyed: false,
 		};
 		assert!(validate_output(&output, &limits).is_err());
+
+		let limits = WonderfulWasmtimeLimits {
+			max_effect_kind_bytes: 3,
+			max_total_effect_bytes: 5,
+			..WonderfulWasmtimeLimits::default()
+		};
+		let output = GuestOutput {
+			state: Vec::new(),
+			result: Vec::new(),
+			effects: vec![GuestEffect {
+				kind: "kind".to_owned(),
+				payload: vec![1, 2],
+			}],
+			destroyed: false,
+		};
+		assert!(validate_output(&output, &limits).is_err());
+
+		let error =
+			CellGuestInvocationError::bounded_guest_error("X".repeat(100), "message".repeat(1_000));
+		assert_eq!(error.code.len(), 64);
+		assert_eq!(error.message.chars().count(), 4096);
 	}
 }

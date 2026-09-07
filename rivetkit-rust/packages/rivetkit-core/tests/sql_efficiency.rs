@@ -594,16 +594,24 @@ fn query_catalog() -> Vec<QueryCase> {
 			expectation: indexed(Some("_rivet_schedule_events_trigger_at"), all_schedules),
 		},
 		QueryCase {
-			id: "schedule.claim_one_shots",
-			sql: queries::claim_one_shots_sql(3),
+			id: "schedule.claim_one_shot",
+			sql: queries::CLAIM_ONE_SHOT_SCHEDULE_SQL.into(),
 			params: vec![
-				0_i64.into(),
+				5_i64.into(),
 				text("at:00000000"),
 				0_i64.into(),
-				text("at:00000003"),
-				3_i64.into(),
-				text("at:00000006"),
-				6_i64.into(),
+				0_i64.into(),
+			],
+			expectation: indexed(None, all_schedules),
+		},
+		QueryCase {
+			id: "schedule.complete_one_shot",
+			sql: queries::COMPLETE_ONE_SHOT_SCHEDULE_SQL.into(),
+			params: vec![
+				text("at:00000000"),
+				0_i64.into(),
+				0_i64.into(),
+				5_i64.into(),
 			],
 			expectation: indexed(None, all_schedules),
 		},
@@ -704,6 +712,16 @@ fn query_catalog() -> Vec<QueryCase> {
 				Some("_rivet_operation_effects_pending"),
 				&["_rivet_operation_effects"],
 			),
+		},
+		QueryCase {
+			id: "transactional.count_pending_effect_operations",
+			sql: queries::COUNT_PENDING_TRANSACTIONAL_EFFECT_OPERATIONS_SQL.into(),
+			params: vec![],
+			expectation: bounded_scan(&[AllowedScan {
+				table: "_rivet_operations",
+				reason: "counting protected operations inspects each retained operation and probes its indexed effects",
+				bound: "runtime backlog admission and terminal-operation compaction bound retained operations",
+			}]),
 		},
 		QueryCase {
 			id: "transactional.ack_effect",

@@ -502,9 +502,14 @@ pub fn cleanup_old_remote_sqlite_requests(ctx: &mut EnvoyContext) {
 				age_ms = now.duration_since(request.timestamp).as_millis() as u64,
 				"remote sqlite request expired by cleanup; if was_sent=true this indicates an abandoned in-flight request"
 			);
-			let _ = request
-				.response_tx
-				.send(Err(anyhow::anyhow!("remote sqlite request timed out")));
+			let error = if request.sent {
+				anyhow::anyhow!(RemoteSqliteIndeterminateResultError {
+					operation: request.request.operation(),
+				})
+			} else {
+				anyhow::anyhow!("remote sqlite request timed out")
+			};
+			let _ = request.response_tx.send(Err(error));
 		}
 	}
 }
@@ -521,9 +526,14 @@ pub fn fail_sqlite_requests_with_shutdown(ctx: &mut EnvoyContext) {
 pub fn fail_remote_sqlite_requests_with_shutdown(ctx: &mut EnvoyContext) {
 	for (_id, request) in ctx.remote_sqlite_requests.drain() {
 		METRICS.remote_sqlite_requests_inflight.dec();
-		let _ = request
-			.response_tx
-			.send(Err(anyhow::anyhow!(EnvoyShutdownError)));
+		let error = if request.sent {
+			anyhow::anyhow!(RemoteSqliteIndeterminateResultError {
+				operation: request.request.operation(),
+			})
+		} else {
+			anyhow::anyhow!(EnvoyShutdownError)
+		};
+		let _ = request.response_tx.send(Err(error));
 	}
 }
 
@@ -833,6 +843,33 @@ mod tests {
 			.expect_err("pending request should fail during shutdown");
 		assert!(err.downcast_ref::<EnvoyShutdownError>().is_some());
 		assert!(ctx.remote_sqlite_requests.is_empty());
+	}
+
+	#[tokio::test]
+	async fn sent_remote_sqlite_shutdown_is_indeterminate() {
+		let mut ctx = new_envoy_context();
+		let (ws_tx, mut ws_rx) = tokio::sync::mpsc::unbounded_channel();
+		crate::connection::install_connection(&ctx.shared, ws_tx).await;
+		let (tx, rx) = oneshot::channel();
+
+		handle_remote_sqlite_request(
+			&mut ctx,
+			RemoteSqliteRequest::Execute(execute_request()),
+			None,
+			tx,
+		)
+		.await;
+		assert!(matches!(ws_rx.recv().await, Some(WsTxMessage::Send(_))));
+		fail_remote_sqlite_requests_with_shutdown(&mut ctx);
+
+		let err = rx
+			.await
+			.expect("response sender should complete")
+			.expect_err("sent request should be indeterminate during shutdown");
+		assert!(
+			err.downcast_ref::<RemoteSqliteIndeterminateResultError>()
+				.is_some()
+		);
 	}
 
 	#[tokio::test]

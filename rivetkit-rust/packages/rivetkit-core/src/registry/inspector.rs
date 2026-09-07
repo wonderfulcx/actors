@@ -325,7 +325,14 @@ impl RegistryDispatcher {
 		);
 		let conn = match instance
 			.ctx
-			.connect_conn(Vec::new(), false, None, None, async { Ok(Vec::new()) })
+			.connect_conn(
+				Vec::new(),
+				false,
+				None,
+				None,
+				crate::actor::messages::ConnectionProtocol::Request,
+				async { Ok(Vec::new()) },
+			)
 			.await
 		{
 			Ok(conn) => conn,

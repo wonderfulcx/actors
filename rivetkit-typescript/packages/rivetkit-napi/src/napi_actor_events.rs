@@ -559,6 +559,7 @@ pub(crate) async fn dispatch_event(
 			params,
 			request,
 			reply,
+			..
 		} => {
 			let on_before_connect = bindings.on_before_connect.clone();
 			let create_conn_state = bindings.create_conn_state.clone();

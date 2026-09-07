@@ -33,7 +33,6 @@ pub const MAX_HISTORY: i64 = 1_000;
 pub const MAX_ACTOR_HISTORY: i64 = 10_000;
 pub const MIN_INTERVAL_MS: i64 = 5_000;
 const DEFAULT_HISTORY_LIMIT: i64 = 20;
-const CLAIM_ONE_SHOT_BATCH_SIZE: usize = 128;
 pub(crate) const GLOBAL_HISTORY_PRUNE_INTERVAL: usize = 100;
 pub(crate) const GLOBAL_HISTORY_RETAINED_ROWS: i64 =
 	MAX_ACTOR_HISTORY - GLOBAL_HISTORY_PRUNE_INTERVAL as i64;
@@ -596,33 +595,40 @@ impl ActorContext {
 			.iter()
 			.map(|row| read_stored_schedule(row))
 			.collect::<Result<Vec<_>>>()?;
-		let claim_statements = due_schedules
-			.iter()
-			.filter(|event| event.kind == ScheduleKind::At)
-			.collect::<Vec<_>>()
-			.chunks(CLAIM_ONE_SHOT_BATCH_SIZE)
-			.map(|events| {
-				let mut params = Vec::with_capacity(events.len() * 2 + 1);
-				params.push(BindParam::Integer(ScheduleKind::At.as_i64()));
-				for event in events {
-					params.push(BindParam::Text(event.event_id.clone()));
-					params.push(BindParam::Integer(event.trigger_at));
-				}
-				SqliteBatchStatement {
-					sql: claim_one_shots_sql(events.len()),
-					params: Some(params),
-				}
-			})
-			.collect::<Vec<_>>();
-		if !claim_statements.is_empty() {
-			self.sql()
-				.execute_batch(claim_statements)
-				.await
-				.context("claim due one-shot schedules")?;
-		}
 		let mut dispatches = Vec::new();
 		for event in due_schedules {
 			if event.kind == ScheduleKind::At {
+				if self
+					.0
+					.schedule_running
+					.insert_sync(event.event_id.clone())
+					.is_err()
+				{
+					continue;
+				}
+				let claim = self
+					.sql()
+					.execute(
+						CLAIM_ONE_SHOT_SCHEDULE_SQL,
+						Some(vec![
+							BindParam::Integer(now_ms),
+							BindParam::Text(event.event_id.clone()),
+							BindParam::Integer(ScheduleKind::At.as_i64()),
+							BindParam::Integer(event.trigger_at),
+						]),
+					)
+					.await;
+				match claim {
+					Ok(result) if result.changes == 1 => {}
+					Ok(_) => {
+						self.0.schedule_running.remove_sync(&event.event_id);
+						continue;
+					}
+					Err(error) => {
+						self.0.schedule_running.remove_sync(&event.event_id);
+						return Err(error).context("claim due one-shot schedule");
+					}
+				}
 				dispatches.push(DueScheduleDispatch {
 					event_id: event.event_id.clone(),
 					action: event.action,
@@ -718,6 +724,36 @@ impl ActorContext {
 		// best effort so a transient sync failure cannot discard valid dispatches.
 		self.sync_alarm_logged().await;
 		Ok(dispatches)
+	}
+
+	pub(crate) async fn finish_one_shot_schedule(
+		&self,
+		event_id: &str,
+		scheduled_at: i64,
+		claimed_at: i64,
+	) {
+		let _mutation = self.0.schedule_mutation_lock.lock().await;
+		match self
+			.sql()
+			.execute(
+				COMPLETE_ONE_SHOT_SCHEDULE_SQL,
+				Some(vec![
+					BindParam::Text(event_id.to_owned()),
+					BindParam::Integer(ScheduleKind::At.as_i64()),
+					BindParam::Integer(scheduled_at),
+					BindParam::Integer(claimed_at),
+				]),
+			)
+			.await
+		{
+			Ok(result) if result.changes > 0 => self.record_schedules_updated(),
+			Ok(_) => {}
+			Err(error) => {
+				tracing::error!(?error, event_id, "failed to complete one-shot schedule");
+			}
+		}
+		self.mark_schedule_dirty();
+		self.sync_alarm_logged().await;
 	}
 
 	pub(crate) async fn finish_schedule_dispatch(
@@ -904,6 +940,11 @@ impl ActorContext {
 			self.run_wake_at(),
 		);
 		self.sync_alarm_timestamp(next_alarm)
+	}
+
+	pub(crate) fn force_schedule_alarm_resync(&self) {
+		self.load_last_pushed_alarm(None);
+		self.mark_schedule_dirty();
 	}
 
 	fn sync_alarm_timestamp(&self, next_alarm: Option<i64>) -> Result<()> {

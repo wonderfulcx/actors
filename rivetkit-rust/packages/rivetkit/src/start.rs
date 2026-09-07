@@ -647,7 +647,9 @@ mod tests {
 	};
 
 	use async_trait::async_trait;
-	use rivetkit_core::{ConnHandle, QueueNextOpts, Request, Response, StateDelta, WebSocket};
+	use rivetkit_core::{
+		ConnHandle, ConnectionProtocol, QueueNextOpts, Request, Response, StateDelta, WebSocket,
+	};
 	use serde::{Deserialize, Serialize};
 	use tokio::sync::mpsc::unbounded_channel;
 	use tokio::sync::{Barrier, oneshot};
@@ -1403,6 +1405,7 @@ mod tests {
 		let (reply_tx, reply_rx) = oneshot::channel();
 		tx.send(ActorEvent::ConnectionPreflight {
 			conn: conn.clone(),
+			protocol: ConnectionProtocol::ActorConnect,
 			params: cbor(&params),
 			request: None,
 			reply: reply_tx.into(),
@@ -1472,6 +1475,7 @@ mod tests {
 		let (reply_tx, reply_rx) = oneshot::channel();
 		tx.send(ActorEvent::ConnectionPreflight {
 			conn: conn("conn-reject", params.clone(), ConnState::default()),
+			protocol: ConnectionProtocol::ActorConnect,
 			params: cbor(&params),
 			request: None,
 			reply: reply_tx.into(),

@@ -6945,6 +6945,7 @@ dependencies = [
  "futures-util",
  "portpicker",
  "reqwest 0.12.22",
+ "rivet-error",
  "rivet-vbare-compiler",
  "rivetkit-client-protocol",
  "rivetkit-core",

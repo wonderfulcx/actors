@@ -16,6 +16,14 @@ use libsqlite3_sys::{
 	sqlite3_step,
 };
 
+const RESULT_LIMITS_PREFIX: &str = "/*rivet-result-limits:";
+
+#[derive(Clone, Copy, Debug)]
+struct ResultLimits {
+	max_rows: usize,
+	max_bytes: usize,
+}
+
 #[derive(Clone, Copy, Debug, Default)]
 pub struct SqliteQueryProfile {
 	pub bind_count: u64,
@@ -139,6 +147,7 @@ pub fn execute_single_statement(
 	sql: &str,
 	params: Option<&[BindParam]>,
 ) -> Result<ExecuteResult> {
+	let result_limits = parse_result_limits(sql)?;
 	let c_sql = CString::new(sql).map_err(|err| anyhow!(err.to_string()))?;
 	let mut stmt = ptr::null_mut();
 	let mut tail = ptr::null();
@@ -178,6 +187,8 @@ pub fn execute_single_statement(
 		}
 
 		let columns = collect_columns(stmt);
+		let mut result_bytes = columns.iter().map(String::len).sum::<usize>();
+		validate_result_bytes(result_limits, result_bytes)?;
 		let mut rows = Vec::new();
 		loop {
 			let step_rc = unsafe { sqlite3_step(stmt) };
@@ -192,6 +203,9 @@ pub fn execute_single_statement(
 				));
 			}
 
+			validate_result_rows(result_limits, rows.len().saturating_add(1))?;
+			result_bytes = result_bytes.saturating_add(row_logical_bytes(stmt, columns.len()));
+			validate_result_bytes(result_limits, result_bytes)?;
 			let mut row = Vec::with_capacity(columns.len());
 			for index in 0..columns.len() {
 				row.push(column_value(stmt, index as i32));
@@ -220,6 +234,7 @@ pub fn execute_single_statement_profiled(
 	sql: &str,
 	params: Option<&[BindParam]>,
 ) -> Result<(ExecuteResult, SqliteQueryProfile)> {
+	let result_limits = parse_result_limits(sql)?;
 	let c_sql = CString::new(sql).map_err(|err| anyhow!(err.to_string()))?;
 	let mut stmt = ptr::null_mut();
 	let mut tail = ptr::null();
@@ -264,6 +279,8 @@ pub fn execute_single_statement_profiled(
 
 		let columns = collect_columns(stmt);
 		profile.result_columns = columns.len() as u64;
+		let mut result_bytes = columns.iter().map(String::len).sum::<usize>();
+		validate_result_bytes(result_limits, result_bytes)?;
 		let mut rows = Vec::new();
 		loop {
 			let step_rc = unsafe { sqlite3_step(stmt) };
@@ -278,6 +295,9 @@ pub fn execute_single_statement_profiled(
 				));
 			}
 
+			validate_result_rows(result_limits, rows.len().saturating_add(1))?;
+			result_bytes = result_bytes.saturating_add(row_logical_bytes(stmt, columns.len()));
+			validate_result_bytes(result_limits, result_bytes)?;
 			let mut row = Vec::with_capacity(columns.len());
 			for index in 0..columns.len() {
 				row.push(column_value_profiled(stmt, index as i32, &mut profile));
@@ -303,6 +323,57 @@ pub fn execute_single_statement_profiled(
 	}
 
 	result
+}
+
+fn parse_result_limits(sql: &str) -> Result<Option<ResultLimits>> {
+	let Some(rest) = sql.strip_prefix(RESULT_LIMITS_PREFIX) else {
+		return Ok(None);
+	};
+	let (encoded, _) = rest
+		.split_once("*/")
+		.ok_or_else(|| anyhow!("malformed sqlite result limits"))?;
+	let (max_rows, max_bytes) = encoded
+		.split_once(':')
+		.ok_or_else(|| anyhow!("malformed sqlite result limits"))?;
+	Ok(Some(ResultLimits {
+		max_rows: max_rows
+			.parse()
+			.map_err(|_| anyhow!("invalid sqlite result row limit"))?,
+		max_bytes: max_bytes
+			.parse()
+			.map_err(|_| anyhow!("invalid sqlite result byte limit"))?,
+	}))
+}
+
+fn validate_result_rows(limits: Option<ResultLimits>, rows: usize) -> Result<()> {
+	if limits.is_some_and(|limits| rows > limits.max_rows) {
+		return Err(anyhow!("sqlite result exceeds configured row limit"));
+	}
+	Ok(())
+}
+
+fn validate_result_bytes(limits: Option<ResultLimits>, bytes: usize) -> Result<()> {
+	if limits.is_some_and(|limits| bytes > limits.max_bytes) {
+		return Err(anyhow!("sqlite result exceeds configured byte limit"));
+	}
+	Ok(())
+}
+
+fn row_logical_bytes(stmt: *mut libsqlite3_sys::sqlite3_stmt, columns: usize) -> usize {
+	(0..columns)
+		.map(|index| {
+			let index = index as i32;
+			match unsafe { sqlite3_column_type(stmt, index) } {
+				SQLITE_NULL => 0,
+				SQLITE_INTEGER | SQLITE_FLOAT => 8,
+				SQLITE_TEXT | SQLITE_BLOB => {
+					usize::try_from(unsafe { sqlite3_column_bytes(stmt, index) })
+						.unwrap_or(usize::MAX)
+				}
+				_ => 0,
+			}
+		})
+		.fold(0usize, usize::saturating_add)
 }
 
 pub fn exec_statements(db: *mut sqlite3, sql: &str) -> Result<QueryResult> {
@@ -777,6 +848,26 @@ mod tests {
 		assert_eq!(result.rows, vec![vec![ColumnValue::Integer(7)]]);
 		assert_eq!(result.changes, 0);
 		assert_eq!(result.last_insert_row_id, None);
+	}
+
+	#[test]
+	fn execute_single_statement_enforces_incremental_result_limits() {
+		let db = MemoryDb::open();
+		for sql in [
+			"/*rivet-result-limits:1:1024*/SELECT 1 UNION ALL SELECT 2",
+			"/*rivet-result-limits:1:4*/SELECT zeroblob(1024) AS x",
+		] {
+			let error = execute_single_statement(db.as_ptr(), sql, None)
+				.expect_err("result limit should reject statement");
+			assert!(error.to_string().contains("result exceeds configured"));
+		}
+		let error = execute_single_statement_profiled(
+			db.as_ptr(),
+			"/*rivet-result-limits:1:4*/SELECT zeroblob(1024) AS x",
+			None,
+		)
+		.expect_err("profiled result limit should reject statement");
+		assert!(error.to_string().contains("byte limit"));
 	}
 
 	#[test]

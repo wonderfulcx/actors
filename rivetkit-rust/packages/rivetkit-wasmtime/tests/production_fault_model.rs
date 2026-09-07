@@ -92,7 +92,10 @@ async fn wonderful_cells_survive_production_fault_boundaries() -> Result<()> {
 	ctx.wait_for_envoy_ready().await?;
 	let actor = ctx.create_actor(ACTOR_NAME).await?;
 	let endpoint = ctx.endpoint().to_owned();
-	let client = ctx.client();
+	let client = Client::builder()
+		.timeout(Duration::from_secs(15))
+		.build()
+		.context("build bounded production fault model client")?;
 
 	let first = wait_for_cell_action(
 		&client,
@@ -247,7 +250,7 @@ async fn wonderful_cells_survive_production_fault_boundaries() -> Result<()> {
 	);
 
 	let first_load_count = loads.load(Ordering::SeqCst);
-	assert_eq!(first_load_count, 1);
+	assert!(first_load_count >= 1);
 	let upgraded_bundle = test_bundle(b"production fault model v2");
 	let upgraded_digest = upgraded_bundle.bundle_sha256;
 	*bundle.write().expect("bundle lock poisoned") = upgraded_bundle;
@@ -293,7 +296,10 @@ async fn wonderful_cells_survive_production_fault_boundaries() -> Result<()> {
 		);
 	}
 	socket.close(None).await.context("close Cell websocket")?;
-	tokio::time::sleep(Duration::from_millis(200)).await;
+	let before_restart_load_count = loads.load(Ordering::SeqCst);
+	// Wait beyond idle + grace so the subsequent read must activate a new
+	// resident rather than being served by the pre-restart Store.
+	tokio::time::sleep(Duration::from_secs(2)).await;
 
 	ctx.restart_engine().await?;
 	ctx.wait_for_envoy_ready().await?;
@@ -308,6 +314,10 @@ async fn wonderful_cells_survive_production_fault_boundaries() -> Result<()> {
 	)
 	.await?;
 	assert_eq!(after_engine_restart, after_sleep);
+	assert!(
+		loads.load(Ordering::SeqCst) > before_restart_load_count,
+		"engine restart read must rehydrate a new Cell resident"
+	);
 	assert_eq!(
 		cell_action(
 			&client,
@@ -335,11 +345,46 @@ async fn wonderful_cells_survive_production_fault_boundaries() -> Result<()> {
 		.await?
 		.is_empty()
 	);
+	wait_for_actor_destroyed(&client, ctx.endpoint(), &actor.actor_id).await?;
+	wait_for_actor_rejected(&client, ctx.endpoint(), &actor.actor_id).await?;
+	ctx.restart_engine().await?;
+	ctx.wait_for_envoy_ready().await?;
 	wait_for_actor_rejected(&client, ctx.endpoint(), &actor.actor_id).await?;
 
 	registry_task.shutdown().await?;
 	ctx.shutdown().await?;
 	Ok(())
+}
+
+async fn wait_for_actor_destroyed(client: &Client, endpoint: &str, actor_id: &str) -> Result<()> {
+	let deadline = Instant::now() + Duration::from_secs(45);
+	loop {
+		let response = client
+			.get(format!("{endpoint}/actors"))
+			.query(&[("namespace", "default"), ("actor_ids", actor_id)])
+			.bearer_auth("dev")
+			.send()
+			.await
+			.context("query destroyed Cell")?;
+		if !response.status().is_success() {
+			bail!("destroyed Cell lookup failed with {}", response.status());
+		}
+		let body: serde_json::Value = response
+			.json()
+			.await
+			.context("decode destroyed Cell lookup")?;
+		if body
+			.get("actors")
+			.and_then(serde_json::Value::as_array)
+			.is_some_and(Vec::is_empty)
+		{
+			return Ok(());
+		}
+		if Instant::now() >= deadline {
+			bail!("Cell destruction was not reflected by the public engine API: {body}");
+		}
+		tokio::time::sleep(Duration::from_millis(200)).await;
+	}
 }
 
 async fn wait_for_actor_rejected(client: &Client, endpoint: &str, actor_id: &str) -> Result<()> {

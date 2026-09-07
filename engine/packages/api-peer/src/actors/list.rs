@@ -54,6 +54,7 @@ pub async fn list(ctx: ApiCtx, _path: (), query: ListQuery) -> Result<ListRespon
 			.actors
 			.into_iter()
 			.filter(|actor| actor.namespace_id == namespace.namespace_id)
+			.filter(|actor| include_destroyed || actor.destroy_ts.is_none())
 			.collect();
 
 		// Sort by create ts desc

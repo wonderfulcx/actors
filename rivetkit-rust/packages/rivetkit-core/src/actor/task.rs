@@ -1236,9 +1236,13 @@ impl ActorTask {
 
 		self.ctx.metrics().set_startup_phase(StartupPhase::CoreInit);
 		let core_init_started_at = Instant::now();
-		let core_init_result: Result<()> = async {
+		let core_init_result: Result<Vec<crate::actor::connection::ConnHandle>> = async {
 			self.ctx.load_persisted_actor(persisted.actor);
 			self.ctx.load_last_pushed_alarm(persisted.last_pushed_alarm);
+			// Envoy acknowledgement proves local writer admission, not durable
+			// engine installation. Every generation must therefore resend the
+			// persisted alarm before trusting it.
+			self.ctx.force_schedule_alarm_resync();
 			self.ctx.load_run_wake_at(persisted.run_wake_at);
 			// New manual-startup runtimes must not persist initialization until the
 			// runtime startup_ready handshake completes. The runtime preamble owns
@@ -1263,14 +1267,14 @@ impl ActorTask {
 				.restore_hibernatable_connections()
 				.await
 				.context("restore hibernatable connections")?;
-			Self::settle_hibernated_connections(self.ctx.clone())
+			let dead_hibernated_connections = Self::settle_hibernated_connections(self.ctx.clone())
 				.await
 				.context("settle hibernated connections")?;
 			self.ctx.init_alarms().await;
-			Ok(())
+			Ok(dead_hibernated_connections)
 		}
 		.await;
-		self.ctx.metrics().observe_startup_phase_result(
+		let dead_hibernated_connections = self.ctx.metrics().observe_startup_phase_result(
 			StartupPhase::CoreInit,
 			Some(is_new),
 			core_init_started_at,
@@ -1289,6 +1293,12 @@ impl ActorTask {
 			runtime_preamble_started_at,
 			runtime_preamble_result,
 		)?;
+		for conn in dead_hibernated_connections {
+			self.send_actor_event(
+				"stale_hibernated_connection_closed",
+				ActorEvent::ConnectionClosed { conn },
+			)?;
+		}
 
 		self.ctx
 			.metrics()
@@ -1418,9 +1428,11 @@ impl ActorTask {
 		Ok(())
 	}
 
-	async fn settle_hibernated_connections(ctx: ActorContext) -> Result<()> {
+	async fn settle_hibernated_connections(
+		ctx: ActorContext,
+	) -> Result<Vec<crate::actor::connection::ConnHandle>> {
 		let actor_id = ctx.actor_id().to_owned();
-		let mut dead_conn_ids = Vec::new();
+		let mut dead_connections = Vec::new();
 		for conn in ctx.conns().filter(|conn| conn.is_hibernatable()) {
 			let hibernation = conn.hibernation();
 			let Some(hibernation) = hibernation else {
@@ -1430,7 +1442,7 @@ impl ActorTask {
 					outcome = "dead_missing_hibernation_metadata",
 					"hibernated connection settled"
 				);
-				dead_conn_ids.push(conn.id().to_owned());
+				dead_connections.push(conn.clone());
 				continue;
 			};
 			let is_live = ctx
@@ -1450,12 +1462,13 @@ impl ActorTask {
 				outcome = "dead_not_live",
 				"hibernated connection settled"
 			);
-			dead_conn_ids.push(conn.id().to_owned());
+			dead_connections.push(conn.clone());
 		}
 
-		for conn_id in dead_conn_ids {
-			ctx.request_hibernation_transport_removal(conn_id.clone());
-			ctx.remove_conn(&conn_id);
+		for conn in &dead_connections {
+			let conn_id = conn.id();
+			ctx.request_hibernation_transport_removal(conn_id.to_owned());
+			ctx.remove_conn(conn_id);
 			tracing::debug!(
 				actor_id = %actor_id,
 				conn_id = %conn_id,
@@ -1463,7 +1476,7 @@ impl ActorTask {
 			);
 		}
 
-		Ok(())
+		Ok(dead_connections)
 	}
 
 	async fn fire_due_alarms(&mut self) -> Result<()> {

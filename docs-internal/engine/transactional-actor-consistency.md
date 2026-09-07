@@ -63,10 +63,17 @@ operation/effect identity for idempotency where available.
 
 No effect may leave the runtime before the aggregate commit. Pending effects
 protect their operation records from retention pruning. The Wonderful Wasmtime
-adapter resumes an ordered per-actor effect pump on startup and after each command.
-Socket output is acknowledged after transport admission and may duplicate after a
-crash. Schedule upsert/cancel and effect acknowledgement use one actor-local SQLite
-transaction, making schedule delivery idempotent across that crash boundary.
+adapter resumes an ordered per-actor effect pump on startup and after each command,
+holding an internal keep-awake region while effects are pending or retrying. Socket
+output is acknowledged after active Envoy writer admission and may duplicate after a
+crash. Schedule upsert/cancel mutations commit with the originating aggregate; their
+ordered post-commit effects reconcile alarm transport and acknowledge delivery
+idempotently. One-shot schedule rows remain durable until the action reply, with a
+persisted claim token preventing an old completion from deleting a replacement, and
+every actor generation idempotently resubmits its persisted engine alarm. The runtime
+compacts unprotected terminal operations after every delivery attempt and rejects new
+effect-producing commands at the bounded pending-operation limit; destruction remains
+admissible so backlog cannot defeat the local deletion fence.
 
 ## Actor-local schema
 
@@ -92,7 +99,10 @@ instance per active actor. It must:
 - call `commit` before replying;
 - call `fail` and discard/reset the resident after traps or handler errors;
 - fence and discard the resident on indeterminate storage outcomes;
-- expose only bounded, explicitly linked host capabilities.
+- expose only bounded, explicitly linked host capabilities;
+- deny guest access to `_rivet_*`/SQLite metadata and extension surfaces;
+- establish the destruction admission fence before returning a committed destroy reply,
+  while retaining the durable intent until engine destruction completes.
 
 Compiled component machine code may be shared. Stores, linear memory, the
 StarlingMonkey/SpiderMonkey heap, and resident component instances may not be

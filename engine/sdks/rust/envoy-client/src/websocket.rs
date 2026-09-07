@@ -29,6 +29,7 @@ pub(crate) enum WsOutgoing {
 	Message {
 		data: Vec<u8>,
 		binary: bool,
+		admitted: Option<tokio::sync::oneshot::Sender<bool>>,
 	},
 	Flush {
 		tx: tokio::sync::oneshot::Sender<()>,
@@ -40,12 +41,34 @@ pub(crate) enum WsOutgoing {
 }
 
 impl WebSocketSender {
-	pub fn send(&self, data: Vec<u8>, binary: bool) {
-		let _ = self.tx.send(WsOutgoing::Message { data, binary });
+	pub fn send(&self, data: Vec<u8>, binary: bool) -> bool {
+		self.tx
+			.send(WsOutgoing::Message {
+				data,
+				binary,
+				admitted: None,
+			})
+			.is_ok()
 	}
 
-	pub fn send_text(&self, text: &str) {
-		self.send(text.as_bytes().to_vec(), false);
+	pub fn send_text(&self, text: &str) -> bool {
+		self.send(text.as_bytes().to_vec(), false)
+	}
+
+	pub async fn send_admitted(&self, data: Vec<u8>, binary: bool) -> bool {
+		let (tx, rx) = tokio::sync::oneshot::channel();
+		if self
+			.tx
+			.send(WsOutgoing::Message {
+				data,
+				binary,
+				admitted: Some(tx),
+			})
+			.is_err()
+		{
+			return false;
+		}
+		rx.await.unwrap_or(false)
 	}
 
 	pub async fn flush(&self) {

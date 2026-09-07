@@ -19,7 +19,7 @@ use crate::actor::config::ActorConfig;
 use crate::actor::context::ActorContext;
 use crate::actor::internal_storage;
 use crate::actor::lifecycle_hooks::Reply;
-use crate::actor::messages::{ActorEvent, Request};
+use crate::actor::messages::{ActorEvent, ConnectionProtocol, Request};
 use crate::actor::persist::{
 	decode_latest_with_embedded_version, encode_latest_with_embedded_version,
 };
@@ -29,6 +29,8 @@ use crate::time::timeout;
 use crate::types::ConnId;
 
 pub(crate) type EventSendCallback = Arc<dyn Fn(OutgoingEvent) -> Result<()> + Send + Sync>;
+pub(crate) type EventSendAdmittedCallback =
+	Arc<dyn Fn(OutgoingEvent) -> BoxFuture<'static, Result<()>> + Send + Sync>;
 pub(crate) type DisconnectCallback =
 	Arc<dyn Fn(Option<String>) -> BoxFuture<'static, Result<()>> + Send + Sync>;
 type StateChangeCallback = Arc<dyn Fn(&ConnHandle) + Send + Sync>;
@@ -158,6 +160,7 @@ struct ConnHandleInner {
 	hibernation: RwLock<Option<HibernatableConnectionMetadata>>,
 	state_change_handler: RwLock<Option<StateChangeCallback>>,
 	event_sender: RwLock<Option<EventSendCallback>>,
+	event_sender_admitted: RwLock<Option<EventSendAdmittedCallback>>,
 	transport_disconnect_handler: RwLock<Option<DisconnectCallback>>,
 	disconnect_handler: RwLock<Option<DisconnectCallback>>,
 }
@@ -179,6 +182,7 @@ impl ConnHandle {
 			hibernation: RwLock::new(None),
 			state_change_handler: RwLock::new(None),
 			event_sender: RwLock::new(None),
+			event_sender_admitted: RwLock::new(None),
 			transport_disconnect_handler: RwLock::new(None),
 			disconnect_handler: RwLock::new(None),
 		}))
@@ -248,6 +252,19 @@ impl ConnHandle {
 		self.try_send(name, args)
 	}
 
+	/// Waits until the active transport writer admits the event.
+	pub async fn send_admitted(&self, name: &str, args: &[u8]) -> Result<()> {
+		let event = OutgoingEvent {
+			name: name.to_owned(),
+			args: args.to_vec(),
+		};
+		let admitted = self.0.event_sender_admitted.read().clone();
+		match admitted {
+			Some(admitted) => admitted(event).await,
+			None => self.event_sender()?(event),
+		}
+	}
+
 	pub async fn disconnect(&self, reason: Option<&str>) -> Result<()> {
 		if let Some(handler) = self.transport_disconnect_handler() {
 			handler(reason.map(str::to_owned)).await?;
@@ -258,6 +275,13 @@ impl ConnHandle {
 
 	pub(crate) fn configure_event_sender(&self, event_sender: Option<EventSendCallback>) {
 		*self.0.event_sender.write() = event_sender;
+	}
+
+	pub(crate) fn configure_event_sender_admitted(
+		&self,
+		event_sender: Option<EventSendAdmittedCallback>,
+	) {
+		*self.0.event_sender_admitted.write() = event_sender;
 	}
 
 	pub(crate) fn configure_disconnect_handler(
@@ -468,6 +492,45 @@ impl Iterator for ConnHandles<'_> {
 	}
 }
 
+struct PendingConnectionOpenGuard {
+	ctx: ActorContext,
+	conn_id: ConnId,
+	armed: bool,
+}
+
+impl PendingConnectionOpenGuard {
+	fn new(ctx: ActorContext, conn_id: ConnId) -> Self {
+		Self {
+			ctx,
+			conn_id,
+			armed: true,
+		}
+	}
+
+	fn disarm(&mut self) {
+		self.armed = false;
+	}
+}
+
+impl Drop for PendingConnectionOpenGuard {
+	fn drop(&mut self) {
+		if !self.armed {
+			return;
+		}
+		let Some(conn) = self.ctx.remove_existing_for_disconnect(&self.conn_id) else {
+			return;
+		};
+		conn.clear_subscriptions();
+		self.ctx.record_connections_updated();
+		self.ctx.reset_sleep_timer();
+		tracing::debug!(
+			actor_id = %self.ctx.actor_id(),
+			conn_id = %self.conn_id,
+			"canceled pending connection open cleaned up"
+		);
+	}
+}
+
 impl ActorContext {
 	pub(crate) fn configure_connection_storage(&self, config: ActorConfig) {
 		*self.0.connection_config.write() = config;
@@ -642,6 +705,7 @@ impl ActorContext {
 		is_hibernatable: bool,
 		hibernation: Option<HibernatableConnectionMetadata>,
 		request: Option<Request>,
+		protocol: ConnectionProtocol,
 		create_state: F,
 	) -> Result<ConnHandle>
 	where
@@ -653,6 +717,7 @@ impl ActorContext {
 			hibernation,
 			request,
 			create_state,
+			protocol,
 			|_| Ok(()),
 		)
 		.await
@@ -665,6 +730,7 @@ impl ActorContext {
 		hibernation: Option<HibernatableConnectionMetadata>,
 		request: Option<Request>,
 		create_state: F,
+		protocol: ConnectionProtocol,
 		prepare_connection: P,
 	) -> Result<ConnHandle>
 	where
@@ -692,14 +758,26 @@ impl ActorContext {
 			return Err(error);
 		}
 
-		self.emit_connection_preflight(&conn, params.clone(), request.clone())
+		self.emit_connection_preflight(&conn, protocol, params.clone(), request.clone())
 			.await?;
 		self.insert_existing(conn.clone());
+		let mut pending_open = PendingConnectionOpenGuard::new(self.clone(), conn.id().to_owned());
 
 		if let Err(error) = self.emit_connection_open(&conn, request).await {
-			self.remove_existing(conn.id());
+			pending_open.disarm();
+			if let Err(cleanup_error) = self
+				.disconnect_managed(conn.id(), Some("connection open failed".to_owned()))
+				.await
+			{
+				tracing::error!(
+					conn_id = conn.id(),
+					?cleanup_error,
+					"failed to clean up rejected connection open"
+				);
+			}
 			return Err(error);
 		}
+		pending_open.disarm();
 		self.0.metrics.inc_connections_total();
 		self.record_connections_updated();
 		self.reset_sleep_timer();
@@ -880,6 +958,7 @@ impl ActorContext {
 	async fn emit_connection_preflight(
 		&self,
 		conn: &ConnHandle,
+		protocol: ConnectionProtocol,
 		params: Vec<u8>,
 		request: Option<Request>,
 	) -> Result<()> {
@@ -891,6 +970,7 @@ impl ActorContext {
 		self.try_send_actor_event(
 			ActorEvent::ConnectionPreflight {
 				conn: conn.clone(),
+				protocol,
 				params,
 				request,
 				reply: Reply::from(reply_tx),

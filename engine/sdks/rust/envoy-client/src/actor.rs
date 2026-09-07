@@ -573,8 +573,12 @@ fn spawn_ws_outgoing_task(
 		while let Some(msg) = outgoing_rx.recv().await {
 			idx += 1;
 			match msg {
-				WsOutgoing::Message { data, binary } => {
-					ws_send(
+				WsOutgoing::Message {
+					data,
+					binary,
+					admitted,
+				} => {
+					let failed = ws_send(
 						&shared,
 						protocol::ToRivet::ToRivetTunnelMessage(protocol::ToRivetTunnelMessage {
 							message_id: protocol::MessageId {
@@ -589,6 +593,9 @@ fn spawn_ws_outgoing_task(
 						}),
 					)
 					.await;
+					if let Some(admitted) = admitted {
+						let _ = admitted.send(!failed);
+					}
 				}
 				WsOutgoing::Flush { tx } => {
 					let _ = tx.send(());

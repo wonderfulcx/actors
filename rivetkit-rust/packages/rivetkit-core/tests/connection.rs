@@ -16,7 +16,7 @@ mod moved_tests {
 	};
 	use crate::actor::context::ActorContext;
 	use crate::actor::keys::make_connection_key;
-	use crate::actor::messages::ActorEvent;
+	use crate::actor::messages::{ActorEvent, ConnectionProtocol};
 	use crate::actor::task::LifecycleEvent;
 	use crate::kv::Kv;
 
@@ -71,7 +71,14 @@ mod moved_tests {
 		});
 
 		let conn = ctx
-			.connect_with_state(vec![1], false, None, None, async { Ok(vec![2]) })
+			.connect_with_state(
+				vec![1],
+				false,
+				None,
+				None,
+				ConnectionProtocol::ActorConnect,
+				async { Ok(vec![2]) },
+			)
 			.await
 			.expect("connection should succeed");
 
@@ -113,7 +120,14 @@ mod moved_tests {
 		});
 
 		let error = ctx
-			.connect_with_state(vec![1], false, None, None, async { Ok(vec![2]) })
+			.connect_with_state(
+				vec![1],
+				false,
+				None,
+				None,
+				ConnectionProtocol::ActorConnect,
+				async { Ok(vec![2]) },
+			)
 			.await
 			.expect_err("connection should fail");
 
@@ -160,13 +174,77 @@ mod moved_tests {
 		});
 
 		let error = ctx
-			.connect_with_state(vec![1], false, None, None, async { Ok(vec![2]) })
+			.connect_with_state(
+				vec![1],
+				false,
+				None,
+				None,
+				ConnectionProtocol::ActorConnect,
+				async { Ok(vec![2]) },
+			)
 			.await
 			.expect_err("connection should fail");
 
 		assert!(format!("{error:#}").contains("reject after transport close"));
 		assert_eq!(*closed_conn_id.lock(), None);
 		event_task.await.expect("event task should complete");
+	}
+
+	#[tokio::test]
+	async fn canceled_connection_open_removes_inserted_connection() {
+		let ctx = ActorContext::new_with_kv(
+			"actor-canceled-open",
+			"actor",
+			Vec::new(),
+			"local",
+			Kv::new_in_memory(),
+		);
+		ctx.configure_connection_runtime(crate::actor::config::ActorConfig::default());
+		let (events_tx, mut events_rx) = mpsc::unbounded_channel();
+		ctx.configure_actor_events(Some(events_tx));
+
+		let connect = tokio::spawn({
+			let ctx = ctx.clone();
+			async move {
+				ctx.connect_with_state(
+					vec![1],
+					false,
+					None,
+					None,
+					ConnectionProtocol::ActorConnect,
+					async { Ok(vec![2]) },
+				)
+				.await
+			}
+		});
+		match events_rx.recv().await.expect("preflight event") {
+			ActorEvent::ConnectionPreflight { reply, .. } => reply.send(Ok(())),
+			other => panic!("unexpected event: {other:?}"),
+		}
+		let (conn_id, open_reply) = match events_rx.recv().await.expect("open event") {
+			ActorEvent::ConnectionOpen { conn, reply, .. } => (conn.id().to_owned(), reply),
+			other => panic!("unexpected event: {other:?}"),
+		};
+		assert!(ctx.connection(&conn_id).is_some());
+
+		connect.abort();
+		assert!(
+			connect
+				.await
+				.expect_err("connection setup should be canceled")
+				.is_cancelled()
+		);
+		assert!(
+			ctx.connection(&conn_id).is_none(),
+			"canceling setup after insertion must remove the pending connection"
+		);
+		drop(open_reply);
+		assert!(
+			tokio::time::timeout(Duration::from_millis(20), events_rx.recv())
+				.await
+				.is_err(),
+			"a connection that never opened must not emit a close callback"
+		);
 	}
 
 	#[test]
@@ -254,6 +332,7 @@ mod moved_tests {
 					..HibernatableConnectionMetadata::default()
 				}),
 				None,
+				ConnectionProtocol::ActorConnect,
 				async { Ok(vec![9]) },
 			)
 			.await
@@ -332,7 +411,14 @@ mod moved_tests {
 		});
 
 		let non_hibernatable = ctx
-			.connect_with_state(vec![1], false, None, None, async { Ok(vec![2]) })
+			.connect_with_state(
+				vec![1],
+				false,
+				None,
+				None,
+				ConnectionProtocol::ActorConnect,
+				async { Ok(vec![2]) },
+			)
 			.await
 			.expect("non-hibernatable connection should open");
 		non_hibernatable.set_state(vec![3]);
@@ -356,6 +442,7 @@ mod moved_tests {
 					..HibernatableConnectionMetadata::default()
 				}),
 				None,
+				ConnectionProtocol::ActorConnect,
 				async { Ok(vec![5]) },
 			)
 			.await

@@ -8,33 +8,59 @@ pub(super) fn send_actor_connect_message(
 	message: &ActorConnectToClient,
 	max_outgoing_message_size: usize,
 ) -> std::result::Result<(), ActorConnectSendError> {
-	match encoding {
-		ActorConnectEncoding::Json => {
-			let payload = encode_actor_connect_message_json(message)
-				.map_err(ActorConnectSendError::Encode)?;
-			if payload.len() > max_outgoing_message_size {
-				return Err(ActorConnectSendError::OutgoingTooLong);
-			}
-			sender.send_text(&payload);
-		}
-		ActorConnectEncoding::Cbor => {
-			let payload = encode_actor_connect_message_cbor(message)
-				.map_err(ActorConnectSendError::Encode)?;
-			if payload.len() > max_outgoing_message_size {
-				return Err(ActorConnectSendError::OutgoingTooLong);
-			}
-			sender.send(payload, true);
-		}
-		ActorConnectEncoding::Bare => {
-			let payload =
-				encode_actor_connect_message(message).map_err(ActorConnectSendError::Encode)?;
-			if payload.len() > max_outgoing_message_size {
-				return Err(ActorConnectSendError::OutgoingTooLong);
-			}
-			sender.send(payload, true);
-		}
+	let (payload, binary) =
+		encode_actor_connect_transport(encoding, message, max_outgoing_message_size)?;
+	if sender.send(payload, binary) {
+		Ok(())
+	} else {
+		Err(ActorConnectSendError::Encode(anyhow::anyhow!(
+			"actor connection transport is closed"
+		)))
 	}
-	Ok(())
+}
+
+pub(super) async fn send_actor_connect_message_admitted(
+	sender: &WebSocketSender,
+	encoding: ActorConnectEncoding,
+	message: &ActorConnectToClient,
+	max_outgoing_message_size: usize,
+) -> std::result::Result<(), ActorConnectSendError> {
+	let (payload, binary) =
+		encode_actor_connect_transport(encoding, message, max_outgoing_message_size)?;
+	if sender.send_admitted(payload, binary).await {
+		Ok(())
+	} else {
+		Err(ActorConnectSendError::Encode(anyhow::anyhow!(
+			"actor connection transport is closed"
+		)))
+	}
+}
+
+fn encode_actor_connect_transport(
+	encoding: ActorConnectEncoding,
+	message: &ActorConnectToClient,
+	max_outgoing_message_size: usize,
+) -> std::result::Result<(Vec<u8>, bool), ActorConnectSendError> {
+	let (payload, binary) = match encoding {
+		ActorConnectEncoding::Json => (
+			encode_actor_connect_message_json(message)
+				.map_err(ActorConnectSendError::Encode)?
+				.into_bytes(),
+			false,
+		),
+		ActorConnectEncoding::Cbor => (
+			encode_actor_connect_message_cbor(message).map_err(ActorConnectSendError::Encode)?,
+			true,
+		),
+		ActorConnectEncoding::Bare => (
+			encode_actor_connect_message(message).map_err(ActorConnectSendError::Encode)?,
+			true,
+		),
+	};
+	if payload.len() > max_outgoing_message_size {
+		return Err(ActorConnectSendError::OutgoingTooLong);
+	}
+	Ok((payload, binary))
 }
 
 pub(super) fn encode_actor_connect_message(message: &ActorConnectToClient) -> Result<Vec<u8>> {

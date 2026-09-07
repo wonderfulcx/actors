@@ -11,6 +11,7 @@ publish = false
 [dependencies]
 anyhow.workspace = true
 async-trait.workspace = true
+rivet-error.workspace = true
 rivetkit-core = { workspace = true, features = ["native-runtime"] }
 serde.workspace = true
 serde_bare.workspace = true

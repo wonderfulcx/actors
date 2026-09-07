@@ -133,8 +133,8 @@ pub use actor::context::{
 pub use actor::factory::{ActorActionMode, ActorEntryFn, ActorFactory};
 pub use actor::lifecycle_hooks::{ActorEvents, ActorStart, Reply};
 pub use actor::messages::{
-	ActorEvent, ActorHttpResponse, QueueSendResult, QueueSendStatus, Request, Response,
-	SerializeStateReason, StateDelta, StreamingResponse, WorkflowKvWrite,
+	ActorEvent, ActorHttpResponse, ConnectionProtocol, QueueSendResult, QueueSendStatus, Request,
+	Response, SerializeStateReason, StateDelta, StreamingResponse, WorkflowKvWrite,
 };
 pub use actor::queue::{
 	CompletableQueueMessage, EnqueueAndWaitOpts, QueueMessage, QueueNextBatchOpts, QueueNextOpts,

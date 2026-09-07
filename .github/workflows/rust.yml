@@ -31,6 +31,8 @@ jobs:
             rust:
               - '**/*.rs'
               - '**/*.bare'
+              - '**/*.wasm'
+              - '**/*.sha256'
               - '**/Cargo.toml'
               - '**/Cargo.lock'
               - 'rivetkit-rust/packages/rivetkit-core/scripts/**/*.sh'
@@ -104,6 +106,29 @@ jobs:
           fi
           cargo publish -p rivet-error-macros --dry-run
 
+  cells-test:
+    name: Wonderful Cells fault model
+    runs-on: depot-ubuntu-24.04-8
+    needs: changes
+    if: needs.changes.outputs.rust == 'true'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: "rust-ci"
+          cache-on-failure: true
+      - name: Build production engine
+        run: cargo build -p rivet-engine
+      - name: Verify Wonderful Cells guest fixture
+        run: sha256sum --check rivetkit-rust/packages/rivetkit-wasmtime/tests/fixtures/wonderful_cell_test_guest.component.wasm.sha256
+      - name: Test Wonderful Cells adapter
+        run: cargo test -p rivetkit-wasmtime --lib
+      - name: Test Wonderful Cells production fault model
+        run: cargo test -p rivetkit-wasmtime --test production_fault_model
+
   # test:
   #   name: Test
   #   runs-on: depot-ubuntu-24.04-8
@@ -143,7 +168,7 @@ jobs:
   status-check:
     name: Rust CI Status
     runs-on: ubuntu-latest
-    needs: [changes, fmt, check]
+    needs: [changes, fmt, check, cells-test]
     if: always()
     steps:
       - name: Check job status
@@ -155,7 +180,7 @@ jobs:
           fi
 
           # If rust code changed, verify all jobs passed
-          if [ "${{ needs.fmt.result }}" == "failure" ] || [ "${{ needs.check.result }}" == "failure" ]; then
+          if [ "${{ needs.fmt.result }}" == "failure" ] || [ "${{ needs.check.result }}" == "failure" ] || [ "${{ needs.cells-test.result }}" == "failure" ]; then
             echo "One or more required jobs failed"
             exit 1
           fi

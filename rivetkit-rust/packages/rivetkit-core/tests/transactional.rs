@@ -3,9 +3,11 @@ mod moved_tests {
 
 	use crate::actor::context::tests::new_with_kv;
 	use crate::kv::tests::new_in_memory;
+	use crate::testing::ActorContextHarness;
 	use crate::{
-		ActorContext, StateDelta, TransactionalEffect, TransactionalOperationAdmission,
-		TransactionalOperationKind, TransactionalOperationRequest, TransactionalOperationStatus,
+		ActorConfig, ActorContext, StateDelta, TransactionalEffect,
+		TransactionalOperationAdmission, TransactionalOperationFailure, TransactionalOperationKind,
+		TransactionalOperationRequest, TransactionalOperationStatus, TransactionalScheduleUpsert,
 	};
 
 	fn context(actor_id: &str) -> ActorContext {
@@ -220,6 +222,123 @@ mod moved_tests {
 	}
 
 	#[tokio::test]
+	async fn schedule_mutation_commits_with_its_effect_intent() {
+		let ctx = context("actor-transactional-schedule");
+		let operation = executing(&ctx, request("op-schedule", b"input")).await;
+		operation
+			.stage_schedule_upsert(TransactionalScheduleUpsert {
+				event_id: "wonderful:test",
+				trigger_at: 5_000,
+				action: "wake",
+				args: &[1, 2],
+			})
+			.await
+			.expect("stage schedule mutation");
+		operation
+			.commit(
+				Vec::new(),
+				Vec::new(),
+				vec![TransactionalEffect {
+					kind: "schedule".to_owned(),
+					payload: Vec::new(),
+				}],
+				200,
+			)
+			.await
+			.expect("commit schedule and effect");
+
+		let schedule = ctx
+			.get_scheduled_event("wonderful:test")
+			.await
+			.expect("load committed schedule")
+			.expect("schedule is visible at aggregate commit");
+		assert_eq!(schedule.action, "wake");
+		assert_eq!(schedule.args, vec![1, 2]);
+		assert_eq!(
+			ctx.pending_transactional_effect_operation_count()
+				.await
+				.unwrap(),
+			1
+		);
+	}
+
+	#[tokio::test]
+	async fn schedule_capacity_failure_rolls_back_before_effect_commit() {
+		let ctx = ActorContextHarness::new().context_with_config(
+			"actor-transactional-schedule-capacity",
+			"transactional",
+			Vec::new(),
+			"local",
+			ActorConfig {
+				max_schedules: 1,
+				..ActorConfig::default()
+			},
+		);
+		ctx.at(5_000, "existing", &[])
+			.await
+			.expect("fill schedule capacity");
+		let operation = executing(&ctx, request("op-over-capacity", b"input")).await;
+		let error = operation
+			.stage_schedule_upsert(TransactionalScheduleUpsert {
+				event_id: "wonderful:overflow",
+				trigger_at: 6_000,
+				action: "wake",
+				args: &[],
+			})
+			.await
+			.expect_err("schedule capacity must be checked inside aggregate transaction");
+		operation
+			.fail_with(TransactionalOperationFailure::from_error(&error), 200)
+			.await
+			.expect("terminalize rejected schedule operation");
+		assert!(
+			ctx.get_scheduled_event("wonderful:overflow")
+				.await
+				.expect("load rejected schedule")
+				.is_none()
+		);
+		assert!(
+			ctx.pending_transactional_effects(1)
+				.await
+				.unwrap()
+				.is_empty()
+		);
+	}
+
+	#[tokio::test]
+	async fn compaction_retains_newest_terminal_operations() {
+		let ctx = context("actor-transactional-compaction");
+		for (operation_id, completed_at) in [("op-1", 100), ("op-2", 200), ("op-3", 300)] {
+			executing(&ctx, request(operation_id, operation_id.as_bytes()))
+				.await
+				.commit(Vec::new(), Vec::new(), Vec::new(), completed_at)
+				.await
+				.expect("commit operation");
+		}
+
+		assert_eq!(
+			ctx.compact_transactional_operations(2)
+				.await
+				.expect("compact operations"),
+			1,
+		);
+		assert!(
+			ctx.transactional_operation("op-1")
+				.await
+				.expect("load oldest operation")
+				.is_none()
+		);
+		for operation_id in ["op-2", "op-3"] {
+			assert!(
+				ctx.transactional_operation(operation_id)
+					.await
+					.expect("load retained operation")
+					.is_some()
+			);
+		}
+	}
+
+	#[tokio::test]
 	async fn effects_are_ordered_acknowledged_and_protect_operations_from_pruning() {
 		let ctx = context("actor-transactional-effects");
 		for (operation_id, completed_at) in [("op-1", 100), ("op-2", 200)] {
@@ -239,6 +358,12 @@ mod moved_tests {
 				.expect("commit operation");
 		}
 
+		assert_eq!(
+			ctx.pending_transactional_effect_operation_count()
+				.await
+				.expect("count pending effect operations"),
+			2,
+		);
 		let effects = ctx
 			.pending_transactional_effects(10)
 			.await
@@ -266,6 +391,12 @@ mod moved_tests {
 			ctx.mark_transactional_effect_delivered("op-1", 0, 400)
 				.await
 				.expect("mark first delivered")
+		);
+		assert_eq!(
+			ctx.pending_transactional_effect_operation_count()
+				.await
+				.expect("count remaining effect operations"),
+			1,
 		);
 		assert!(
 			ctx.mark_transactional_effect_delivered("op-2", 0, 500)

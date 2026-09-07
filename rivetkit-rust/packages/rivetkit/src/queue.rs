@@ -12,6 +12,7 @@ use rivetkit_core::{
 use serde::{Serialize, de::DeserializeOwned};
 
 use crate::{actor::Actor, context::Ctx};
+#[cfg(test)]
 const QUEUE_SET_TUPLE_ARITY_MAX: usize = 16;
 pub(crate) type BoxQueueFuture = Pin<Box<dyn Future<Output = Result<Option<Vec<u8>>>> + Send>>;
 

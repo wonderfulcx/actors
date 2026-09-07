@@ -965,6 +965,7 @@ async fn dispatch_event(callbacks: &WasmCallbacks, ctx: &WasmActorContext, event
 			params,
 			request,
 			reply,
+			..
 		} => {
 			let result = run_connection_preflight(callbacks, ctx, conn, params, request).await;
 			if let Err(error) = &result {

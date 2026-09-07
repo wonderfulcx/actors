@@ -53,9 +53,11 @@ guest cannot perform network requests through the component. Component instantia
 fails if a guest requests any other undeclared capability.
 
 Raw HTTP, queue, raw WebSocket, subscription, and generic disconnect events remain
-rejected. Managed connection preflight is admitted by the Wonderful transport policy;
-connection open and close callbacks execute as reserved transactional commands.
-A failed open command rejects the connection. Hibernatable connections therefore do
+rejected. Framework REST/RPC request connections are admitted only as ephemeral action
+context and do not invoke socket lifecycle methods. Managed ActorConnect preflight is
+admitted by the Wonderful transport policy; its connection open and close callbacks
+execute as reserved transactional commands. A failed open command rejects the
+connection. Hibernatable connections therefore do
 not keep the actor resident, and wake recreates the component from committed state.
 
 ## WebSocket and scheduling effects
@@ -80,14 +82,26 @@ prefixes are server-owned and rejected on external actions. Expired connection-o
 replies cancel the guest invocation and discard its Store before commit.
 
 A per-actor effect pump resumes pending effects on startup and after every command,
-delivers in commit/index order, records failed attempts, and retries with backoff.
-Socket delivery is ordered at-least-once: a crash after transport admission and before
-acknowledgement may duplicate an envelope. Missing closed connections are acknowledged
-as stale best-effort output. Schedule insertion/cancellation and effect acknowledgement
-share one actor-local SQLite transaction, preventing crash redelivery from recreating
-an already-fired schedule. Scheduled targets must be manifest-declared commands. Alarm
+delivers in commit/index order, records failed attempts, and retries with backoff while
+holding an internal keep-awake region. Its pending-effect scans, acknowledgements, and
+compaction share the exclusive runtime writer fence so the single remote SQLite
+connection never interleaves transactions. Cancellation is observed only between
+deliveries, never by dropping an in-flight actor-local transaction. Socket delivery is ordered
+at-least-once: durable acknowledgement follows active Envoy writer admission, and a crash
+after admission and before acknowledgement may duplicate an envelope. Missing closed
+connections are acknowledged as stale best-effort output. Schedule insertion/cancellation
+commits with the command aggregate; ordered schedule effects reconcile alarm transport
+and acknowledge idempotently without postponing schedule visibility. Scheduled targets
+must be manifest-declared commands. Alarm
 synchronization failures install one actor-scoped retry that keeps the actor awake until
-the local/engine alarm is armed.
+the local/engine alarm is armed. Every actor generation resubmits its persisted alarm
+because a prior Envoy acknowledgement proves only local writer admission. Due one-shot
+schedules remain durable until their action replies, closing the delete-before-admission
+crash window. A persisted one-shot claim token prevents completion of an old dispatch
+from deleting a same-ID/same-deadline replacement. Compaction runs after every effect
+attempt, and commands that would add effects are rejected once the bounded pending-effect
+operation limit is reached; a committed destruction request always bypasses that
+backpressure so deletion remains available.
 
 ## Query replicas
 
@@ -102,18 +116,22 @@ committed state and transactional commit sequence. The reader gate keeps the sta
 and actor-local database at that version until the query finishes. Query replicas
 never share the writer's heap and are discarded after one call.
 
-Query SQL accepts only one bounded `SELECT` against public tables. Mutable statements,
-CTEs, statement separators, and Rivet internal tables fail with
-`CELL_QUERY_MUTATION_VIOLATION`. The host records attempted SQL mutation even if guest
+All guest SQL is bounded before execution and cannot reference `_rivet_*`, `sqlite_*`,
+dangerous pragmas, extension loading, or file functions. A trusted host prefix makes the
+SQLite executor enforce row/byte result limits incrementally before materialization.
+Query SQL additionally accepts only one `SELECT` against public tables. Mutable
+statements, CTEs, and statement separators fail with `CELL_QUERY_MUTATION_VIOLATION`. The host records attempted SQL mutation even if guest
 code catches the import error. Returned state must exactly equal the snapshot and
 returned effects/destruction intent must be empty, or the query fails with the same
 code.
 
 ## Resource controls
 
-The factory enforces source/manifest/state/result/effect and query-SQL limits,
-component instance/memory/table limits, fuel budgets for activation and each method,
-and a wall-clock method deadline. Fuel exhaustion and traps durably fail the operation
+The factory enforces source/manifest/state/result/effect and SQL limits, aggregate effect
+bytes, bounded guest errors, per-actor query concurrency, explicit component instance/
+memory/table/table-element limits, fuel budgets for activation and each method, and a
+wall-clock method deadline. Terminal operation records are compacted to the configured
+newest-record bound; operations with pending effects remain protected. Fuel exhaustion and traps durably fail the operation
 and discard the resident.
 
 ## Production-path fault validation
