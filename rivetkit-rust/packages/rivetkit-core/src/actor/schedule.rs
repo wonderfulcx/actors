@@ -598,50 +598,9 @@ impl ActorContext {
 		let mut dispatches = Vec::new();
 		for event in due_schedules {
 			if event.kind == ScheduleKind::At {
-				if self
-					.0
-					.schedule_running
-					.insert_sync(event.event_id.clone())
-					.is_err()
-				{
-					continue;
+				if let Some(dispatch) = self.claim_due_one_shot(event, now_ms).await? {
+					dispatches.push(dispatch);
 				}
-				let claim = self
-					.sql()
-					.execute(
-						CLAIM_ONE_SHOT_SCHEDULE_SQL,
-						Some(vec![
-							BindParam::Integer(now_ms),
-							BindParam::Text(event.event_id.clone()),
-							BindParam::Integer(ScheduleKind::At.as_i64()),
-							BindParam::Integer(event.trigger_at),
-						]),
-					)
-					.await;
-				match claim {
-					Ok(result) if result.changes == 1 => {}
-					Ok(_) => {
-						self.0.schedule_running.remove_sync(&event.event_id);
-						continue;
-					}
-					Err(error) => {
-						self.0.schedule_running.remove_sync(&event.event_id);
-						return Err(error).context("claim due one-shot schedule");
-					}
-				}
-				dispatches.push(DueScheduleDispatch {
-					event_id: event.event_id.clone(),
-					action: event.action,
-					args: event.args,
-					fire: ScheduledFireInfo {
-						kind: ScheduleKind::At,
-						id: event.event_id,
-						name: None,
-						scheduled_at: event.trigger_at,
-						fired_at: now_ms,
-					},
-					history_id: None,
-				});
 				continue;
 			}
 
@@ -726,6 +685,67 @@ impl ActorContext {
 		Ok(dispatches)
 	}
 
+	// The caller holds schedule_mutation_lock, but transactional upserts do not.
+	// Claim the current payload at the selected deadline. A changed deadline or
+	// kind is left for the next drain instead of dispatching the stale selection.
+	async fn claim_due_one_shot(
+		&self,
+		event: StoredSchedule,
+		now_ms: i64,
+	) -> Result<Option<DueScheduleDispatch>> {
+		if self
+			.0
+			.schedule_running
+			.insert_sync(event.event_id.clone())
+			.is_err()
+		{
+			return Ok(None);
+		}
+		let claim = self
+			.sql()
+			.execute(
+				CLAIM_ONE_SHOT_SCHEDULE_SQL,
+				Some(vec![
+					BindParam::Integer(now_ms),
+					BindParam::Text(event.event_id.clone()),
+					BindParam::Integer(ScheduleKind::At.as_i64()),
+					BindParam::Integer(event.trigger_at),
+				]),
+			)
+			.await
+			.and_then(|result| {
+				result
+					.rows
+					.first()
+					.map(|row| read_stored_schedule(row))
+					.transpose()
+			});
+		let event = match claim {
+			Ok(Some(claimed)) => claimed,
+			Ok(None) => {
+				self.0.schedule_running.remove_sync(&event.event_id);
+				return Ok(None);
+			}
+			Err(error) => {
+				self.0.schedule_running.remove_sync(&event.event_id);
+				return Err(error).context("claim due one-shot schedule");
+			}
+		};
+		Ok(Some(DueScheduleDispatch {
+			event_id: event.event_id.clone(),
+			action: event.action,
+			args: event.args,
+			fire: ScheduledFireInfo {
+				kind: ScheduleKind::At,
+				id: event.event_id,
+				name: None,
+				scheduled_at: event.trigger_at,
+				fired_at: now_ms,
+			},
+			history_id: None,
+		}))
+	}
+
 	pub(crate) async fn finish_one_shot_schedule(
 		&self,
 		event_id: &str,
@@ -733,6 +753,9 @@ impl ActorContext {
 		claimed_at: i64,
 	) {
 		let _mutation = self.0.schedule_mutation_lock.lock().await;
+		// Upserts clear last_started_at. Keep schedule_running until this delete
+		// finishes so a replacement cannot be reclaimed with the same millisecond
+		// timestamp before the old completion, even when the deadline is unchanged.
 		match self
 			.sql()
 			.execute(

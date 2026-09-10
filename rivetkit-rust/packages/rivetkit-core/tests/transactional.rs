@@ -2,7 +2,9 @@ mod moved_tests {
 	use anyhow::Context;
 
 	use crate::actor::context::tests::new_with_kv;
+	use crate::actor::internal_storage;
 	use crate::kv::tests::new_in_memory;
+	use crate::sqlite::{BindParam, ColumnValue};
 	use crate::testing::ActorContextHarness;
 	use crate::{
 		ActorConfig, ActorContext, StateDelta, TransactionalEffect,
@@ -44,6 +46,229 @@ mod moved_tests {
 			TransactionalOperationAdmission::Existing(_) => {
 				panic!("new operation must execute")
 			}
+		}
+	}
+
+	const AUTOMATIC_ROLLBACK_CASES: [(&str, &str, &str); 3] = [
+		(
+			"statement",
+			"CREATE TABLE rollback_values (value INTEGER PRIMARY KEY)",
+			"INSERT OR ROLLBACK INTO rollback_values VALUES (1)",
+		),
+		(
+			"schema",
+			"CREATE TABLE rollback_values (value INTEGER PRIMARY KEY ON CONFLICT ROLLBACK)",
+			"INSERT INTO rollback_values VALUES (1)",
+		),
+		(
+			"trigger",
+			"CREATE TABLE rollback_values (value INTEGER PRIMARY KEY)",
+			"INSERT INTO rollback_values VALUES (2)",
+		),
+	];
+
+	async fn prepare_automatic_rollback(ctx: &ActorContext, case: &str, schema: &str) {
+		ctx.sql().execute(schema, None).await.unwrap();
+		ctx.sql()
+			.execute("INSERT INTO rollback_values VALUES (1)", None)
+			.await
+			.unwrap();
+		if case == "trigger" {
+			ctx.sql()
+				.execute(
+					"CREATE TRIGGER rollback_insert BEFORE INSERT ON rollback_values WHEN NEW.value = 2 BEGIN SELECT RAISE(ROLLBACK, 'trigger rollback'); END",
+					None,
+				)
+				.await
+				.unwrap();
+		}
+	}
+
+	async fn assert_only_committed_rollback_value(ctx: &ActorContext) {
+		assert_eq!(
+			ctx.sql()
+				.query("SELECT value FROM rollback_values ORDER BY value", None)
+				.await
+				.unwrap()
+				.rows,
+			vec![vec![crate::sqlite::ColumnValue::Integer(1)]],
+		);
+	}
+
+	#[tokio::test]
+	async fn automatic_rollback_prevents_caught_error_from_committing_aggregate() {
+		for (case, schema, failing_sql) in AUTOMATIC_ROLLBACK_CASES {
+			let ctx = context(case);
+			prepare_automatic_rollback(&ctx, case, schema).await;
+			ctx.save_state(vec![StateDelta::ActorState(b"before".to_vec())])
+				.await
+				.unwrap();
+			let operation = executing(&ctx, request("op-rollback", b"input")).await;
+			operation
+				.execute_sql("INSERT INTO rollback_values VALUES (3)", None)
+				.await
+				.unwrap();
+			// A guest can catch this SQLite error and still return a successful result.
+			let _caught = operation.execute_sql(failing_sql, None).await.unwrap_err();
+			let commit_error = operation
+				.commit(
+					vec![StateDelta::ActorState(b"must not persist".to_vec())],
+					b"must not succeed".to_vec(),
+					vec![TransactionalEffect {
+						kind: "socket".to_owned(),
+						payload: b"must not deliver".to_vec(),
+					}],
+					200,
+				)
+				.await
+				.expect_err(case);
+			assert_eq!(
+				rivet_error::RivetError::extract(&commit_error).code(),
+				"transaction_terminal",
+				"{case}",
+			);
+			assert_eq!(ctx.state(), b"before");
+			let snapshot = ctx
+				.sql()
+				.query(
+					crate::actor::internal_storage::LOAD_ACTOR_SNAPSHOT_SQL,
+					None,
+				)
+				.await
+				.unwrap();
+			assert_eq!(
+				snapshot.rows[0][2],
+				crate::sqlite::ColumnValue::Blob(b"before".to_vec())
+			);
+			assert_eq!(ctx.transactional_snapshot_version().await.unwrap(), 0);
+			assert!(
+				ctx.pending_transactional_effects(10)
+					.await
+					.unwrap()
+					.is_empty()
+			);
+			assert_only_committed_rollback_value(&ctx).await;
+			let record = ctx
+				.transactional_operation("op-rollback")
+				.await
+				.unwrap()
+				.unwrap();
+			assert_eq!(record.status, TransactionalOperationStatus::Started);
+			assert!(record.result.is_none());
+			assert!(record.commit_sequence.is_none());
+			assert_eq!(
+				ctx.recover_interrupted_transactional_operations(300)
+					.await
+					.unwrap(),
+				1
+			);
+			assert_eq!(
+				ctx.transactional_operation("op-rollback")
+					.await
+					.unwrap()
+					.unwrap()
+					.status,
+				TransactionalOperationStatus::Interrupted,
+			);
+		}
+	}
+
+	#[tokio::test]
+	async fn automatic_rollback_rejects_subsequent_sql_and_can_record_failure() {
+		for (case, schema, failing_sql) in AUTOMATIC_ROLLBACK_CASES {
+			let ctx = context(case);
+			prepare_automatic_rollback(&ctx, case, schema).await;
+			let operation = executing(&ctx, request("op-rollback", b"input")).await;
+			operation
+				.execute_sql("INSERT INTO rollback_values VALUES (3)", None)
+				.await
+				.unwrap();
+			let caught = operation.execute_sql(failing_sql, None).await.unwrap_err();
+			let subsequent = operation
+				.execute_sql("INSERT INTO rollback_values VALUES (4)", None)
+				.await
+				.expect_err(case);
+			assert_eq!(
+				rivet_error::RivetError::extract(&subsequent).code(),
+				"transaction_terminal"
+			);
+			operation
+				.fail(&caught, 200)
+				.await
+				.expect("durably record a rolled-back operation failure");
+			assert_only_committed_rollback_value(&ctx).await;
+			let record = ctx
+				.transactional_operation("op-rollback")
+				.await
+				.unwrap()
+				.unwrap();
+			assert_eq!(record.status, TransactionalOperationStatus::Failed);
+			assert!(record.result.is_none());
+			assert!(record.commit_sequence.is_none());
+			assert_eq!(ctx.transactional_snapshot_version().await.unwrap(), 0);
+			assert!(
+				ctx.pending_transactional_effects(10)
+					.await
+					.unwrap()
+					.is_empty()
+			);
+		}
+	}
+
+	#[tokio::test]
+	async fn automatic_rollback_terminalizes_explicit_transaction_handles() {
+		for (case, schema, failing_sql) in AUTOMATIC_ROLLBACK_CASES {
+			let ctx = context(case);
+			prepare_automatic_rollback(&ctx, case, schema).await;
+			let tx = ctx.sql().begin_transaction(None).await.unwrap();
+			tx.execute("INSERT INTO rollback_values VALUES (3)", None)
+				.await
+				.unwrap();
+			let _caught = tx.execute(failing_sql, None).await.unwrap_err();
+			for error in [
+				tx.execute("INSERT INTO rollback_values VALUES (4)", None)
+					.await
+					.expect_err(case),
+				tx.commit().await.expect_err(case),
+			] {
+				assert_eq!(
+					rivet_error::RivetError::extract(&error).code(),
+					"transaction_terminal"
+				);
+			}
+			tx.rollback().await.expect("acknowledge completed cleanup");
+			assert_only_committed_rollback_value(&ctx).await;
+			let next = ctx.sql().begin_transaction(None).await.unwrap();
+			next.execute("INSERT INTO rollback_values VALUES (5)", None)
+				.await
+				.unwrap();
+			next.commit().await.expect("coordinator remains usable");
+		}
+	}
+
+	#[tokio::test]
+	async fn statement_errors_conservatively_roll_back_explicit_transactions() {
+		for failing_sql in [
+			"INSERT INTO rollback_values VALUES (1)",
+			"SELECT * FROM missing_table",
+		] {
+			let ctx = context("statement-error");
+			prepare_automatic_rollback(&ctx, "statement", AUTOMATIC_ROLLBACK_CASES[0].1).await;
+			let tx = ctx.sql().begin_transaction(None).await.unwrap();
+			tx.execute("INSERT INTO rollback_values VALUES (3)", None)
+				.await
+				.unwrap();
+			let error = tx.execute(failing_sql, None).await.unwrap_err();
+			assert_eq!(
+				rivet_error::RivetError::extract(&error).code(),
+				"remote_execution_failed"
+			);
+			assert_eq!(
+				rivet_error::RivetError::extract(&tx.commit().await.unwrap_err()).code(),
+				"transaction_terminal"
+			);
+			tx.rollback().await.unwrap();
+			assert_only_committed_rollback_value(&ctx).await;
 		}
 	}
 
@@ -336,6 +561,215 @@ mod moved_tests {
 					.is_some()
 			);
 		}
+	}
+
+	async fn assert_expired_identity_rejected(ctx: &ActorContext, operation_id: &str) {
+		let mut same = request(operation_id, b"original");
+		// A new generation and arrival time do not change the operation identity.
+		same.actor_generation += 1;
+		same.started_at += 1_000;
+		let mut different_input = same.clone();
+		different_input.input = b"different".to_vec();
+		let mut different_name = same.clone();
+		different_name.name = "different".to_owned();
+		let mut different_kind = same.clone();
+		different_kind.kind = TransactionalOperationKind::Http;
+		for (candidate, expected_code) in [
+			(same, "operation_result_expired"),
+			(different_input, "operation_id_conflict"),
+			(different_name, "operation_id_conflict"),
+			(different_kind, "operation_id_conflict"),
+		] {
+			let error = ctx
+				.begin_transactional_operation(candidate, None)
+				.await
+				.err()
+				.expect("expired operation must reject without entering guest code");
+			let structured = rivet_error::RivetError::extract(&error);
+			assert_eq!(structured.group(), "actor");
+			assert_eq!(structured.code(), expected_code, "{operation_id}");
+			assert_eq!(
+				structured.metadata(),
+				Some(serde_json::json!({ "operation_id": operation_id }))
+			);
+		}
+		assert!(
+			ctx.transactional_operation(operation_id)
+				.await
+				.unwrap()
+				.is_none()
+		);
+	}
+
+	async fn assert_result_retention_never_forgets_execution(prune: bool) {
+		let harness = ActorContextHarness::new();
+		let ctx = harness.context("retained-identities", "transactional", Vec::new(), "local");
+		ctx.sql()
+			.execute(
+				"CREATE TABLE committed_values (value INTEGER NOT NULL)",
+				None,
+			)
+			.await
+			.unwrap();
+		let succeeded = executing(&ctx, request("succeeded", b"original")).await;
+		succeeded
+			.execute_sql("INSERT INTO committed_values VALUES (1)", None)
+			.await
+			.unwrap();
+		succeeded
+			.commit(Vec::new(), b"result".to_vec(), Vec::new(), 200)
+			.await
+			.unwrap();
+		let failed = executing(&ctx, request("failed", b"original")).await;
+		failed
+			.execute_sql("INSERT INTO committed_values VALUES (2)", None)
+			.await
+			.unwrap();
+		failed
+			.fail(&anyhow::anyhow!("guest failed"), 250)
+			.await
+			.unwrap();
+		drop(executing(&ctx, request("interrupted", b"original")).await);
+		assert_eq!(
+			ctx.recover_interrupted_transactional_operations(300)
+				.await
+				.unwrap(),
+			1
+		);
+		for (operation_id, status) in [
+			("succeeded", TransactionalOperationStatus::Succeeded),
+			("failed", TransactionalOperationStatus::Failed),
+			("interrupted", TransactionalOperationStatus::Interrupted),
+		] {
+			assert_eq!(
+				ctx.transactional_operation(operation_id)
+					.await
+					.unwrap()
+					.unwrap()
+					.status,
+				status
+			);
+		}
+		executing(&ctx, request("retained", b"original"))
+			.await
+			.commit(Vec::new(), b"newest result".to_vec(), Vec::new(), 500)
+			.await
+			.unwrap();
+		// Leave a durable start without a result. Retention must not erase it.
+		drop(executing(&ctx, request("started", b"original")).await);
+		let removed = if prune {
+			ctx.prune_transactional_operations(400, 10).await.unwrap()
+		} else {
+			ctx.compact_transactional_operations(1).await.unwrap()
+		};
+		assert_eq!(removed, 3);
+		assert_eq!(
+			ctx.transactional_operation("started")
+				.await
+				.unwrap()
+				.unwrap()
+				.status,
+			TransactionalOperationStatus::Started,
+		);
+		assert_eq!(
+			ctx.transactional_operation("retained")
+				.await
+				.unwrap()
+				.unwrap()
+				.result,
+			Some(b"newest result".to_vec()),
+		);
+		for operation_id in ["succeeded", "failed", "interrupted"] {
+			assert_expired_identity_rejected(&ctx, operation_id).await;
+		}
+		assert_eq!(ctx.transactional_snapshot_version().await.unwrap(), 2);
+		drop(ctx);
+
+		// Recreate all actor-local runtime state over the same persisted database.
+		let restarted =
+			harness.context("retained-identities", "transactional", Vec::new(), "local");
+		internal_storage::schema::ensure_internal_schema(restarted.sql())
+			.await
+			.unwrap();
+		assert_eq!(
+			restarted
+				.recover_interrupted_transactional_operations(1_000)
+				.await
+				.unwrap(),
+			1
+		);
+		for operation_id in ["succeeded", "failed", "interrupted"] {
+			assert_expired_identity_rejected(&restarted, operation_id).await;
+		}
+		assert_eq!(restarted.transactional_snapshot_version().await.unwrap(), 2);
+		assert_eq!(
+			restarted
+				.sql()
+				.query("SELECT value FROM committed_values", None)
+				.await
+				.unwrap()
+				.rows,
+			vec![vec![ColumnValue::Integer(1)]],
+		);
+		assert_eq!(
+			restarted
+				.sql()
+				.query("SELECT COUNT(*) FROM _rivet_operation_tombstones", None)
+				.await
+				.unwrap()
+				.rows,
+			vec![vec![ColumnValue::Integer(3)]],
+		);
+		// Rejected duplicates must not leave a transaction handle or poison admission.
+		executing(&restarted, request("new-id", b"original"))
+			.await
+			.commit(Vec::new(), Vec::new(), Vec::new(), 1_100)
+			.await
+			.unwrap();
+	}
+
+	#[tokio::test]
+	async fn compaction_preserves_success_failure_and_interruption_identities_across_restart() {
+		assert_result_retention_never_forgets_execution(false).await;
+	}
+
+	#[tokio::test]
+	async fn pruning_preserves_success_failure_and_interruption_identities_across_restart() {
+		assert_result_retention_never_forgets_execution(true).await;
+	}
+
+	#[tokio::test]
+	async fn expired_identity_is_enforced_by_sql_without_admission_precheck() {
+		let ctx = context("actor-transactional-sql-identity");
+		executing(&ctx, request("expired", b"original"))
+			.await
+			.commit(Vec::new(), Vec::new(), Vec::new(), 200)
+			.await
+			.unwrap();
+		assert_eq!(ctx.compact_transactional_operations(0).await.unwrap(), 1);
+		for sql in [
+			internal_storage::INSERT_TRANSACTIONAL_OPERATION_SQL,
+			"INSERT INTO _rivet_operations (operation_id, input_digest, kind, name, input, status, actor_generation, started_at) VALUES (?, ?, ?, ?, ?, 0, ?, ?)",
+		] {
+			let result = ctx
+				.sql()
+				.execute(
+					sql,
+					Some(vec![
+						BindParam::Text("expired".to_owned()),
+						BindParam::Blob(vec![0; 32]),
+						BindParam::Integer(0),
+						BindParam::Text("increment".to_owned()),
+						BindParam::Blob(b"conflicting input".to_vec()),
+						BindParam::Integer(8),
+						BindParam::Integer(300),
+					]),
+				)
+				.await
+				.unwrap();
+			assert_eq!(result.changes, 0);
+		}
+		assert_expired_identity_rejected(&ctx, "expired").await;
 	}
 
 	#[tokio::test]

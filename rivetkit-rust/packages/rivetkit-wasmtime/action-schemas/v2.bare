@@ -1,0 +1,13 @@
+# Declaration order preserves the original serde tags: COMMAND is 0, QUERY is 1.
+type CellMethodMode enum {
+	COMMAND
+	QUERY
+}
+
+# The vbare header is a little-endian u16. Field order is part of the wire format.
+type CellActionEnvelope struct {
+	mode: CellMethodMode
+	operation_id: str
+	input: data
+	started_at: i64
+}

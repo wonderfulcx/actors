@@ -1,0 +1,5 @@
+{
+  "code": "operation_result_expired",
+  "group": "actor",
+  "message": "Actor operation result has expired and the operation cannot execute again."
+}

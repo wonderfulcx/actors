@@ -31,6 +31,11 @@ jobs:
             rust:
               - '**/*.rs'
               - '**/*.bare'
+              - '**/*.wit'
+              - 'rivetkit-rust/packages/rivetkit-wasmtime/**/*.js'
+              - 'rivetkit-rust/packages/rivetkit-wasmtime/**/*.mjs'
+              - 'rivetkit-rust/packages/rivetkit-wasmtime/**/*.ts'
+              - 'rivetkit-rust/packages/rivetkit-wasmtime/**/package*.json'
               - '**/*.wasm'
               - '**/*.sha256'
               - '**/Cargo.toml'
@@ -124,6 +129,16 @@ jobs:
         run: cargo build -p rivet-engine
       - name: Verify Wonderful Cells guest fixture
         run: sha256sum --check rivetkit-rust/packages/rivetkit-wasmtime/tests/fixtures/wonderful_cell_test_guest.component.wasm.sha256
+      - name: Test transactional core and SQL execution
+        run: |
+          cargo test -p rivetkit-core --lib
+          cargo test -p rivet-depot-client query
+          cargo test -p rivet-envoy-client
+      - name: Check alternate runtime compatibility
+        run: |
+          cargo test -p rivetkit --lib
+          cargo test -p rivetkit-napi --no-run
+          cargo check -p rivetkit-wasm
       - name: Test Wonderful Cells adapter
         run: cargo test -p rivetkit-wasmtime --lib
       - name: Test Wonderful Cells production fault model
@@ -173,6 +188,11 @@ jobs:
     steps:
       - name: Check job status
         run: |
+          if [ "${{ needs.changes.result }}" != "success" ]; then
+            echo "Rust change detection did not succeed"
+            exit 1
+          fi
+
           # If rust code didn't change, consider it a pass
           if [ "${{ needs.changes.outputs.rust }}" != "true" ]; then
             echo "No Rust changes detected, skipping checks"
@@ -180,7 +200,7 @@ jobs:
           fi
 
           # If rust code changed, verify all jobs passed
-          if [ "${{ needs.fmt.result }}" == "failure" ] || [ "${{ needs.check.result }}" == "failure" ] || [ "${{ needs.cells-test.result }}" == "failure" ]; then
+          if [ "${{ needs.fmt.result }}" != "success" ] || [ "${{ needs.check.result }}" != "success" ] || [ "${{ needs.cells-test.result }}" != "success" ]; then
             echo "One or more required jobs failed"
             exit 1
           fi

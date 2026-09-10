@@ -369,10 +369,32 @@ impl ActorContext {
 			)
 			.await
 			.context("persist transactional operation durable start")?;
-		let record = self
-			.transactional_operation(&request.operation_id)
-			.await?
-			.context("transactional operation row missing after admission")?;
+		let Some(record) = self.transactional_operation(&request.operation_id).await? else {
+			// A terminal result can be compacted between admission and this read.
+			// Its identity survives atomically, and must never execute again.
+			let tombstone = self
+				.sql()
+				.query(
+					internal_storage::LOAD_TRANSACTIONAL_OPERATION_TOMBSTONE_SQL,
+					Some(vec![BindParam::Text(request.operation_id.clone())]),
+				)
+				.await
+				.context("load expired transactional operation identity")?;
+			let row = tombstone
+				.rows
+				.first()
+				.context("transactional operation identity missing after admission")?;
+			if read_blob(row, 0, "input_digest")? != input_digest {
+				return Err(TransactionalOperationError::OperationIdConflict {
+					operation_id: request.operation_id,
+				}
+				.build());
+			}
+			return Err(TransactionalOperationError::OperationResultExpired {
+				operation_id: request.operation_id,
+			}
+			.build());
+		};
 		if record.input_digest != input_digest {
 			return Err(TransactionalOperationError::OperationIdConflict {
 				operation_id: request.operation_id,
@@ -564,6 +586,8 @@ impl ActorContext {
 		Ok(result.changes == 1)
 	}
 
+	/// Bounds retained terminal results while preserving Started rows and pending effects.
+	/// Minimal execution identities remain permanently and grow with lifetime operations.
 	pub async fn compact_transactional_operations(&self, retain: u32) -> Result<u64> {
 		let result = self
 			.sql()
@@ -576,6 +600,8 @@ impl ActorContext {
 		u64::try_from(result.changes).context("compacted operation count is negative")
 	}
 
+	/// Removes old terminal results, never their permanent execution identities.
+	/// Started rows and operations with pending effects are not eligible.
 	pub async fn prune_transactional_operations(
 		&self,
 		completed_before: i64,

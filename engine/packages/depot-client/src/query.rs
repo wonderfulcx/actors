@@ -1,27 +1,183 @@
 use std::error::Error;
 use std::ffi::{CStr, CString};
 use std::fmt;
-use std::os::raw::c_char;
+use std::os::raw::{c_char, c_int, c_void};
 use std::ptr;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Result, anyhow};
 pub use depot_client_types::{BindParam, ColumnValue, ExecResult, ExecuteResult, QueryResult};
 use libsqlite3_sys::{
-	SQLITE_BLOB, SQLITE_DONE, SQLITE_FLOAT, SQLITE_INTEGER, SQLITE_NULL, SQLITE_OK, SQLITE_ROW,
+	SQLITE_BLOB, SQLITE_DONE, SQLITE_FLOAT, SQLITE_INTEGER, SQLITE_INTERRUPT,
+	SQLITE_LIMIT_ATTACHED, SQLITE_LIMIT_COLUMN, SQLITE_LIMIT_COMPOUND_SELECT,
+	SQLITE_LIMIT_EXPR_DEPTH, SQLITE_LIMIT_LENGTH, SQLITE_LIMIT_LIKE_PATTERN_LENGTH,
+	SQLITE_LIMIT_SQL_LENGTH, SQLITE_LIMIT_TRIGGER_DEPTH, SQLITE_LIMIT_VARIABLE_NUMBER,
+	SQLITE_LIMIT_VDBE_OP, SQLITE_LIMIT_WORKER_THREADS, SQLITE_NULL, SQLITE_OK, SQLITE_ROW,
 	SQLITE_TEXT, SQLITE_TRANSIENT, sqlite3, sqlite3_bind_blob, sqlite3_bind_double,
 	sqlite3_bind_int64, sqlite3_bind_null, sqlite3_bind_text, sqlite3_changes, sqlite3_column_blob,
 	sqlite3_column_bytes, sqlite3_column_count, sqlite3_column_double, sqlite3_column_int64,
 	sqlite3_column_name, sqlite3_column_text, sqlite3_column_type, sqlite3_errmsg,
-	sqlite3_extended_errcode, sqlite3_finalize, sqlite3_last_insert_rowid, sqlite3_prepare_v2,
-	sqlite3_step,
+	sqlite3_extended_errcode, sqlite3_finalize, sqlite3_last_insert_rowid, sqlite3_limit,
+	sqlite3_prepare_v2, sqlite3_progress_handler, sqlite3_step, sqlite3_stmt,
 };
 
+// This exact leading comment is trusted host metadata, not a guest SQL option.
+// Both forms are supported:
+//   /*rivet-result-limits:rows:bytes*/
+//   /*rivet-result-limits:rows:bytes:deadline_unix_ms:max_vm_steps*/
+// Fields are unsigned decimal integers. Rows/bytes may be zero; deadline/work
+// must be positive. Explicit work and remaining time only tighten the defaults.
+// The absolute deadline includes time queued before reaching this executor.
+// Work counts approximate VM instructions plus SQLite prepare progress units;
+// it rounds down to a callback interval, rather than granting extra work.
 const RESULT_LIMITS_PREFIX: &str = "/*rivet-result-limits:";
+const GUEST_MAX_WALL_TIME: Duration = Duration::from_secs(1);
+const GUEST_MAX_VM_STEPS: u64 = 1_000_000;
+const GUEST_PROGRESS_INTERVAL: u64 = 1_000;
+const GUEST_MAX_VALUE_BYTES: usize = 8 * 1024 * 1024;
+const GUEST_MAX_SQL_BYTES: usize = 1024 * 1024;
+
+// These bound statement structure and native helper work that is not necessarily
+// interruptible by the VM progress handler. They never raise an existing limit.
+const GUEST_CONNECTION_LIMITS: [(c_int, c_int); 10] = [
+	(SQLITE_LIMIT_SQL_LENGTH, GUEST_MAX_SQL_BYTES as c_int),
+	(SQLITE_LIMIT_COLUMN, 256),
+	(SQLITE_LIMIT_EXPR_DEPTH, 100),
+	(SQLITE_LIMIT_COMPOUND_SELECT, 50),
+	(SQLITE_LIMIT_VDBE_OP, 25_000),
+	(SQLITE_LIMIT_ATTACHED, 0),
+	(SQLITE_LIMIT_LIKE_PATTERN_LENGTH, 1024),
+	(SQLITE_LIMIT_VARIABLE_NUMBER, 256),
+	(SQLITE_LIMIT_TRIGGER_DEPTH, 10),
+	(SQLITE_LIMIT_WORKER_THREADS, 0),
+];
 
 #[derive(Clone, Copy, Debug)]
 struct ResultLimits {
 	max_rows: usize,
 	max_bytes: usize,
+	deadline_unix_ms: Option<u64>,
+	max_vm_steps: u64,
+}
+
+struct ProgressBudget {
+	deadline: Instant,
+	remaining_work: u64,
+	interval: u64,
+}
+
+impl ProgressBudget {
+	fn check(&self) -> Result<()> {
+		if self.remaining_work == 0 || Instant::now() >= self.deadline {
+			return Err(SqliteStatementError {
+				code: SQLITE_INTERRUPT,
+				statement_index: 0,
+				message: "sqlite guest statement exceeded native execution budget".to_owned(),
+			}
+			.into());
+		}
+		Ok(())
+	}
+}
+
+unsafe extern "C" fn guest_progress_handler(context: *mut c_void) -> c_int {
+	// SQLite invokes this synchronously on its worker. The guard owns the stable
+	// allocation until after finalization and unregisters it before freeing it.
+	let budget = unsafe { &mut *context.cast::<ProgressBudget>() };
+	budget.remaining_work = budget.remaining_work.saturating_sub(budget.interval);
+	c_int::from(budget.remaining_work == 0 || Instant::now() >= budget.deadline)
+}
+
+/// Scoped native safeguards, not a process memory or hard real-time sandbox.
+/// LENGTH bounds each SQLite value/encoded row (including randomblob before its
+/// allocation), not aggregate memory across values, sorters, caches, or temp
+/// tables. Progress callbacks cover prepare (SQLite >= 3.41) and VM execution,
+/// but cannot preempt an individual native function, VFS I/O, or a busy wait.
+/// Stronger isolation needs bounded VFS temp/storage quotas and cache/dirty-page
+/// budgets, or an isolated executor with an OS memory/deadline limit. Do not use
+/// process-global SQLite heap limits or local temp files to simulate isolation.
+///
+/// The worker owns exclusive access to the connection and this module owns its
+/// progress-handler slot. SQLite has no getter for restoring arbitrary external
+/// handlers, so nesting/replacing another owner's handler is not supported.
+struct NativeStatementBudget {
+	db: *mut sqlite3,
+	progress: Box<ProgressBudget>,
+	previous_limits: Vec<(c_int, c_int)>,
+}
+
+impl NativeStatementBudget {
+	fn install(db: *mut sqlite3, limits: ResultLimits) -> Result<Self> {
+		let started = Instant::now();
+		let remaining = if let Some(deadline) = limits.deadline_unix_ms {
+			let now = SystemTime::now().duration_since(UNIX_EPOCH)?;
+			Duration::from_millis(deadline)
+				.saturating_sub(now)
+				.min(GUEST_MAX_WALL_TIME)
+		} else {
+			GUEST_MAX_WALL_TIME
+		};
+		let work = limits.max_vm_steps.min(GUEST_MAX_VM_STEPS);
+		let interval = work.min(GUEST_PROGRESS_INTERVAL);
+		let mut guard = Self {
+			db,
+			progress: Box::new(ProgressBudget {
+				deadline: started + remaining,
+				remaining_work: work - work % interval,
+				interval,
+			}),
+			previous_limits: Vec::with_capacity(GUEST_CONNECTION_LIMITS.len() + 1),
+		};
+		guard.progress.check()?;
+		for (category, maximum) in GUEST_CONNECTION_LIMITS.into_iter().chain([(
+			SQLITE_LIMIT_LENGTH,
+			limits.max_bytes.min(GUEST_MAX_VALUE_BYTES).max(1) as c_int,
+		)]) {
+			let previous = unsafe { sqlite3_limit(db, category, -1) };
+			guard.previous_limits.push((category, previous));
+			unsafe {
+				sqlite3_limit(db, category, previous.min(maximum));
+			}
+		}
+		unsafe {
+			sqlite3_progress_handler(
+				db,
+				guard.progress.interval as c_int,
+				Some(guest_progress_handler),
+				ptr::from_mut(guard.progress.as_mut()).cast(),
+			);
+		}
+		Ok(guard)
+	}
+
+	fn check(budget: &Option<Self>) -> Result<()> {
+		if let Some(budget) = budget {
+			budget.progress.check()?;
+		}
+		Ok(())
+	}
+}
+
+impl Drop for NativeStatementBudget {
+	fn drop(&mut self) {
+		unsafe {
+			sqlite3_progress_handler(self.db, 0, None, ptr::null_mut());
+			for &(category, previous) in &self.previous_limits {
+				sqlite3_limit(self.db, category, previous);
+			}
+		}
+	}
+}
+
+struct PreparedStatement(*mut sqlite3_stmt);
+
+impl Drop for PreparedStatement {
+	fn drop(&mut self) {
+		// sqlite3_finalize accepts NULL, including failed/empty preparations.
+		unsafe {
+			sqlite3_finalize(self.0);
+		}
+	}
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -147,86 +303,7 @@ pub fn execute_single_statement(
 	sql: &str,
 	params: Option<&[BindParam]>,
 ) -> Result<ExecuteResult> {
-	let result_limits = parse_result_limits(sql)?;
-	let c_sql = CString::new(sql).map_err(|err| anyhow!(err.to_string()))?;
-	let mut stmt = ptr::null_mut();
-	let mut tail = ptr::null();
-	let rc = unsafe { sqlite3_prepare_v2(db, c_sql.as_ptr(), -1, &mut stmt, &mut tail) };
-	if rc != SQLITE_OK {
-		return Err(sqlite_error(
-			db,
-			0,
-			"failed to prepare sqlite execute statement",
-		));
-	}
-	if has_non_whitespace_tail(tail) {
-		if !stmt.is_null() {
-			unsafe {
-				sqlite3_finalize(stmt);
-			}
-		}
-		return Err(SqliteStatementError {
-			code: -1,
-			statement_index: 0,
-			message: "sqlite execute only supports a single statement".to_owned(),
-		}
-		.into());
-	}
-	if stmt.is_null() {
-		return Ok(ExecuteResult {
-			columns: Vec::new(),
-			rows: Vec::new(),
-			changes: 0,
-			last_insert_row_id: None,
-		});
-	}
-
-	let result = (|| {
-		if let Some(params) = params {
-			bind_params(db, stmt, params)?;
-		}
-
-		let columns = collect_columns(stmt);
-		let mut result_bytes = columns.iter().map(String::len).sum::<usize>();
-		validate_result_bytes(result_limits, result_bytes)?;
-		let mut rows = Vec::new();
-		loop {
-			let step_rc = unsafe { sqlite3_step(stmt) };
-			if step_rc == SQLITE_DONE {
-				break;
-			}
-			if step_rc != SQLITE_ROW {
-				return Err(sqlite_error(
-					db,
-					0,
-					"failed to step sqlite execute statement",
-				));
-			}
-
-			validate_result_rows(result_limits, rows.len().saturating_add(1))?;
-			result_bytes = result_bytes.saturating_add(row_logical_bytes(stmt, columns.len()));
-			validate_result_bytes(result_limits, result_bytes)?;
-			let mut row = Vec::with_capacity(columns.len());
-			for index in 0..columns.len() {
-				row.push(column_value(stmt, index as i32));
-			}
-			rows.push(row);
-		}
-
-		let changes = unsafe { sqlite3_changes(db) as i64 };
-		Ok(ExecuteResult {
-			columns,
-			rows,
-			changes,
-			last_insert_row_id: (changes > 0).then(|| unsafe { sqlite3_last_insert_rowid(db) }),
-		})
-	})();
-
-	unsafe {
-		sqlite3_finalize(stmt);
-	}
-
-	result
+	execute_single_statement_inner(db, sql, params, false).map(|(result, _)| result)
 }
 
 pub fn execute_single_statement_profiled(
@@ -234,11 +311,32 @@ pub fn execute_single_statement_profiled(
 	sql: &str,
 	params: Option<&[BindParam]>,
 ) -> Result<(ExecuteResult, SqliteQueryProfile)> {
+	execute_single_statement_inner(db, sql, params, true)
+}
+
+fn execute_single_statement_inner(
+	db: *mut sqlite3,
+	sql: &str,
+	params: Option<&[BindParam]>,
+	profiled: bool,
+) -> Result<(ExecuteResult, SqliteQueryProfile)> {
 	let result_limits = parse_result_limits(sql)?;
+	if result_limits.is_some() && sql.len() > GUEST_MAX_SQL_BYTES {
+		return Err(anyhow!(
+			"sqlite guest statement exceeds native SQL length limit"
+		));
+	}
+	// Declare the budget before the statement so every exit finalizes first,
+	// while limits and callback storage are still alive, then restores state.
+	let budget = result_limits
+		.map(|limits| NativeStatementBudget::install(db, limits))
+		.transpose()?;
 	let c_sql = CString::new(sql).map_err(|err| anyhow!(err.to_string()))?;
-	let mut stmt = ptr::null_mut();
+	let mut prepared = PreparedStatement(ptr::null_mut());
 	let mut tail = ptr::null();
-	let rc = unsafe { sqlite3_prepare_v2(db, c_sql.as_ptr(), -1, &mut stmt, &mut tail) };
+	NativeStatementBudget::check(&budget)?;
+	let rc = unsafe { sqlite3_prepare_v2(db, c_sql.as_ptr(), -1, &mut prepared.0, &mut tail) };
+	let stmt = prepared.0;
 	if rc != SQLITE_OK {
 		return Err(sqlite_error(
 			db,
@@ -246,12 +344,8 @@ pub fn execute_single_statement_profiled(
 			"failed to prepare sqlite execute statement",
 		));
 	}
+	NativeStatementBudget::check(&budget)?;
 	if has_non_whitespace_tail(tail) {
-		if !stmt.is_null() {
-			unsafe {
-				sqlite3_finalize(stmt);
-			}
-		}
 		return Err(SqliteStatementError {
 			code: -1,
 			statement_index: 0,
@@ -271,58 +365,64 @@ pub fn execute_single_statement_profiled(
 		));
 	}
 
-	let result = (|| {
-		let mut profile = SqliteQueryProfile::default();
-		if let Some(params) = params {
+	let mut profile = SqliteQueryProfile::default();
+	if let Some(params) = params {
+		if profiled {
 			bind_params_profiled(db, stmt, params, &mut profile)?;
+		} else {
+			bind_params(db, stmt, params)?;
 		}
-
-		let columns = collect_columns(stmt);
-		profile.result_columns = columns.len() as u64;
-		let mut result_bytes = columns.iter().map(String::len).sum::<usize>();
-		validate_result_bytes(result_limits, result_bytes)?;
-		let mut rows = Vec::new();
-		loop {
-			let step_rc = unsafe { sqlite3_step(stmt) };
-			if step_rc == SQLITE_DONE {
-				break;
-			}
-			if step_rc != SQLITE_ROW {
-				return Err(sqlite_error(
-					db,
-					0,
-					"failed to step sqlite execute statement",
-				));
-			}
-
-			validate_result_rows(result_limits, rows.len().saturating_add(1))?;
-			result_bytes = result_bytes.saturating_add(row_logical_bytes(stmt, columns.len()));
-			validate_result_bytes(result_limits, result_bytes)?;
-			let mut row = Vec::with_capacity(columns.len());
-			for index in 0..columns.len() {
-				row.push(column_value_profiled(stmt, index as i32, &mut profile));
-			}
-			rows.push(row);
-			profile.result_rows = profile.result_rows.saturating_add(1);
-		}
-
-		let changes = unsafe { sqlite3_changes(db) as i64 };
-		Ok((
-			ExecuteResult {
-				columns,
-				rows,
-				changes,
-				last_insert_row_id: (changes > 0).then(|| unsafe { sqlite3_last_insert_rowid(db) }),
-			},
-			profile,
-		))
-	})();
-
-	unsafe {
-		sqlite3_finalize(stmt);
 	}
 
-	result
+	let columns = collect_columns(stmt);
+	profile.result_columns = columns.len() as u64;
+	let mut result_bytes = columns.iter().map(String::len).sum::<usize>();
+	validate_result_bytes(result_limits, result_bytes)?;
+	let mut rows = Vec::new();
+	loop {
+		NativeStatementBudget::check(&budget)?;
+		let step_rc = unsafe { sqlite3_step(stmt) };
+		if step_rc != SQLITE_DONE && step_rc != SQLITE_ROW {
+			return Err(sqlite_error(
+				db,
+				0,
+				"failed to step sqlite execute statement",
+			));
+		}
+		NativeStatementBudget::check(&budget)?;
+		if step_rc == SQLITE_DONE {
+			break;
+		}
+
+		validate_result_rows(result_limits, rows.len().saturating_add(1))?;
+		result_bytes = result_bytes.saturating_add(row_logical_bytes(stmt, columns.len()));
+		validate_result_bytes(result_limits, result_bytes)?;
+		let mut row = Vec::with_capacity(columns.len());
+		for index in 0..columns.len() {
+			row.push(if profiled {
+				column_value_profiled(stmt, index as i32, &mut profile)
+			} else {
+				column_value(stmt, index as i32)
+			});
+		}
+		rows.push(row);
+		profile.result_rows = profile.result_rows.saturating_add(1);
+	}
+
+	let changes = unsafe { sqlite3_changes(db) as i64 };
+	Ok((
+		ExecuteResult {
+			columns,
+			rows,
+			changes,
+			last_insert_row_id: if changes > 0 {
+				Some(unsafe { sqlite3_last_insert_rowid(db) })
+			} else {
+				None
+			},
+		},
+		profile,
+	))
 }
 
 fn parse_result_limits(sql: &str) -> Result<Option<ResultLimits>> {
@@ -332,17 +432,40 @@ fn parse_result_limits(sql: &str) -> Result<Option<ResultLimits>> {
 	let (encoded, _) = rest
 		.split_once("*/")
 		.ok_or_else(|| anyhow!("malformed sqlite result limits"))?;
-	let (max_rows, max_bytes) = encoded
-		.split_once(':')
-		.ok_or_else(|| anyhow!("malformed sqlite result limits"))?;
+	let mut fields = encoded.split(':');
+	let max_rows = parse_limit_field(fields.next())?;
+	let max_bytes = parse_limit_field(fields.next())?;
+	let (deadline_unix_ms, max_vm_steps) = if let Some(deadline) = fields.next() {
+		let deadline = parse_limit_field(Some(deadline))?;
+		let work = parse_limit_field(fields.next())?;
+		if deadline == 0 || work == 0 {
+			return Err(anyhow!(
+				"sqlite native deadline and work limits must be positive"
+			));
+		}
+		(Some(deadline), work)
+	} else {
+		(None, GUEST_MAX_VM_STEPS)
+	};
+	if fields.next().is_some() {
+		return Err(anyhow!("malformed sqlite result limits"));
+	}
 	Ok(Some(ResultLimits {
-		max_rows: max_rows
-			.parse()
-			.map_err(|_| anyhow!("invalid sqlite result row limit"))?,
-		max_bytes: max_bytes
-			.parse()
-			.map_err(|_| anyhow!("invalid sqlite result byte limit"))?,
+		max_rows: usize::try_from(max_rows)?,
+		max_bytes: usize::try_from(max_bytes)?,
+		deadline_unix_ms,
+		max_vm_steps,
 	}))
+}
+
+fn parse_limit_field(field: Option<&str>) -> Result<u64> {
+	let field = field.ok_or_else(|| anyhow!("malformed sqlite result limits"))?;
+	if field.is_empty() || !field.bytes().all(|byte| byte.is_ascii_digit()) {
+		return Err(anyhow!("invalid sqlite limit field"));
+	}
+	field
+		.parse()
+		.map_err(|_| anyhow!("sqlite limit field overflows u64"))
 }
 
 fn validate_result_rows(limits: Option<ResultLimits>, rows: usize) -> Result<()> {
@@ -743,272 +866,5 @@ fn sqlite_error(db: *mut sqlite3, statement_index: u32, context: &str) -> anyhow
 }
 
 #[cfg(test)]
-mod tests {
-	use super::*;
-	use libsqlite3_sys::{sqlite3_close, sqlite3_open};
-
-	struct MemoryDb(*mut sqlite3);
-
-	impl MemoryDb {
-		fn open() -> Self {
-			let name = CString::new(":memory:").unwrap();
-			let mut db = ptr::null_mut();
-			let rc = unsafe { sqlite3_open(name.as_ptr(), &mut db) };
-			assert_eq!(rc, SQLITE_OK);
-			Self(db)
-		}
-
-		fn as_ptr(&self) -> *mut sqlite3 {
-			self.0
-		}
-	}
-
-	impl Drop for MemoryDb {
-		fn drop(&mut self) {
-			unsafe {
-				sqlite3_close(self.0);
-			}
-		}
-	}
-
-	#[test]
-	fn run_and_query_bind_typed_params() {
-		let db = MemoryDb::open();
-		exec_statements(
-			db.as_ptr(),
-			"CREATE TABLE items(id INTEGER PRIMARY KEY, label TEXT, score REAL, payload BLOB);",
-		)
-		.unwrap();
-
-		for (label, payload) in [("alpha", vec![1, 2, 3]), ("empty", Vec::new())] {
-			let result = execute_statement(
-				db.as_ptr(),
-				"INSERT INTO items(label, score, payload) VALUES (?, ?, ?);",
-				Some(&[
-					BindParam::Text(label.to_owned()),
-					BindParam::Float(3.5),
-					BindParam::Blob(payload.clone()),
-				]),
-			)
-			.unwrap();
-			assert_eq!(result.changes, 1);
-
-			let rows = query_statement(
-				db.as_ptr(),
-				"SELECT id, label, score, payload FROM items WHERE label = ?;",
-				Some(&[BindParam::Text(label.to_owned())]),
-			)
-			.unwrap();
-			assert_eq!(rows.columns, vec!["id", "label", "score", "payload"]);
-			assert_eq!(rows.rows.len(), 1);
-			assert_eq!(rows.rows[0][1], ColumnValue::Text(label.to_owned()));
-			assert_eq!(rows.rows[0][2], ColumnValue::Float(3.5));
-			assert_eq!(rows.rows[0][3], ColumnValue::Blob(payload));
-		}
-	}
-
-	#[test]
-	fn exec_returns_last_statement_rows() {
-		let db = MemoryDb::open();
-		let result = exec_statements(
-			db.as_ptr(),
-			"CREATE TABLE items(id INTEGER); INSERT INTO items VALUES (1), (2); SELECT COUNT(*) AS count FROM items;",
-		)
-		.unwrap();
-
-		assert_eq!(result.columns, vec!["count"]);
-		assert_eq!(result.rows, vec![vec![ColumnValue::Integer(2)]]);
-	}
-
-	#[test]
-	fn exec_reports_the_actual_failing_statement_index() {
-		let db = MemoryDb::open();
-		exec_statements(
-			db.as_ptr(),
-			"CREATE TABLE unique_items(value INTEGER UNIQUE);",
-		)
-		.unwrap();
-
-		let error = exec_statements(
-			db.as_ptr(),
-			"INSERT INTO unique_items VALUES (1); INSERT INTO unique_items VALUES (1);",
-		)
-		.expect_err("the second statement should violate the unique constraint");
-		let typed = error.downcast_ref::<SqliteStatementError>().unwrap();
-		assert_eq!(typed.code, libsqlite3_sys::SQLITE_CONSTRAINT_UNIQUE);
-		assert_eq!(typed.statement_index, 1);
-	}
-
-	#[test]
-	fn execute_single_statement_returns_rows_and_metadata() {
-		let db = MemoryDb::open();
-		let result = execute_single_statement(db.as_ptr(), "SELECT 7 AS value;", None).unwrap();
-
-		assert_eq!(result.columns, vec!["value"]);
-		assert_eq!(result.rows, vec![vec![ColumnValue::Integer(7)]]);
-		assert_eq!(result.changes, 0);
-		assert_eq!(result.last_insert_row_id, None);
-	}
-
-	#[test]
-	fn execute_single_statement_enforces_incremental_result_limits() {
-		let db = MemoryDb::open();
-		for sql in [
-			"/*rivet-result-limits:1:1024*/SELECT 1 UNION ALL SELECT 2",
-			"/*rivet-result-limits:1:4*/SELECT zeroblob(1024) AS x",
-		] {
-			let error = execute_single_statement(db.as_ptr(), sql, None)
-				.expect_err("result limit should reject statement");
-			assert!(error.to_string().contains("result exceeds configured"));
-		}
-		let error = execute_single_statement_profiled(
-			db.as_ptr(),
-			"/*rivet-result-limits:1:4*/SELECT zeroblob(1024) AS x",
-			None,
-		)
-		.expect_err("profiled result limit should reject statement");
-		assert!(error.to_string().contains("byte limit"));
-	}
-
-	#[test]
-	fn profiled_execute_counts_bind_and_result_logical_bytes_during_conversion() {
-		let db = MemoryDb::open();
-		let (result, profile) = execute_single_statement_profiled(
-			db.as_ptr(),
-			"SELECT ?, ?, ?, ?;",
-			Some(&[
-				BindParam::Integer(7),
-				BindParam::Text("hello".to_owned()),
-				BindParam::Blob(vec![1, 2, 3]),
-				BindParam::Blob(Vec::new()),
-			]),
-		)
-		.unwrap();
-
-		assert_eq!(result.rows.len(), 1);
-		assert_eq!(result.rows[0][3], ColumnValue::Blob(Vec::new()));
-		assert_eq!(profile.bind_count, 4);
-		assert_eq!(profile.bind_logical_bytes, 16);
-		assert_eq!(profile.result_rows, 1);
-		assert_eq!(profile.result_columns, 4);
-		assert_eq!(profile.result_logical_bytes, 16);
-	}
-
-	#[test]
-	fn execute_single_statement_returns_write_metadata() {
-		let db = MemoryDb::open();
-		exec_statements(
-			db.as_ptr(),
-			"CREATE TABLE execute_items(id INTEGER PRIMARY KEY, label TEXT);",
-		)
-		.unwrap();
-
-		let result = execute_single_statement(
-			db.as_ptr(),
-			"INSERT INTO execute_items(label) VALUES (?);",
-			Some(&[BindParam::Text("alpha".to_owned())]),
-		)
-		.unwrap();
-
-		assert_eq!(result.columns, Vec::<String>::new());
-		assert_eq!(result.rows, Vec::<Vec<ColumnValue>>::new());
-		assert_eq!(result.changes, 1);
-		assert_eq!(result.last_insert_row_id, Some(1));
-	}
-
-	#[test]
-	fn execute_single_statement_collects_insert_returning_rows() {
-		let db = MemoryDb::open();
-		exec_statements(
-			db.as_ptr(),
-			"CREATE TABLE execute_returning(id INTEGER PRIMARY KEY, label TEXT);",
-		)
-		.unwrap();
-
-		let result = execute_single_statement(
-			db.as_ptr(),
-			"INSERT INTO execute_returning(label) VALUES ('bravo') RETURNING id, label;",
-			None,
-		)
-		.unwrap();
-
-		assert_eq!(result.columns, vec!["id", "label"]);
-		assert_eq!(
-			result.rows,
-			vec![vec![
-				ColumnValue::Integer(1),
-				ColumnValue::Text("bravo".to_owned())
-			]]
-		);
-		assert_eq!(result.changes, 1);
-		assert_eq!(result.last_insert_row_id, Some(1));
-	}
-
-	#[test]
-	fn execute_single_statement_collects_readonly_pragma_rows() {
-		let db = MemoryDb::open();
-		let result = execute_single_statement(db.as_ptr(), "PRAGMA user_version;", None).unwrap();
-
-		assert_eq!(result.columns, vec!["user_version"]);
-		assert_eq!(result.rows, vec![vec![ColumnValue::Integer(0)]]);
-		assert_eq!(result.changes, 0);
-	}
-
-	#[test]
-	fn execute_single_statement_runs_mutating_pragma() {
-		let db = MemoryDb::open();
-		let result =
-			execute_single_statement(db.as_ptr(), "PRAGMA user_version = 9;", None).unwrap();
-
-		assert_eq!(result.columns, Vec::<String>::new());
-		assert_eq!(result.rows, Vec::<Vec<ColumnValue>>::new());
-
-		let version = execute_single_statement(db.as_ptr(), "PRAGMA user_version;", None).unwrap();
-		assert_eq!(version.rows, vec![vec![ColumnValue::Integer(9)]]);
-	}
-
-	#[test]
-	fn execute_single_statement_rejects_multi_statement_sql() {
-		let db = MemoryDb::open();
-		let err = execute_single_statement(db.as_ptr(), "SELECT 1; SELECT 2;", None)
-			.expect_err("multi statement execute should fail");
-
-		assert!(
-			err.to_string().contains("single statement"),
-			"unexpected error: {err:#}"
-		);
-		let typed = err.downcast_ref::<SqliteStatementError>().unwrap();
-		assert_eq!(typed.code, -1);
-		assert_eq!(typed.statement_index, 0);
-	}
-
-	#[test]
-	fn execute_single_statement_reports_extended_result_code() {
-		let db = MemoryDb::open();
-		exec_statements(
-			db.as_ptr(),
-			"CREATE TABLE unique_items(value TEXT UNIQUE); INSERT INTO unique_items VALUES ('same');",
-		)
-		.unwrap();
-		let err = execute_single_statement(
-			db.as_ptr(),
-			"INSERT INTO unique_items VALUES ('same')",
-			None,
-		)
-		.expect_err("unique constraint should fail");
-		let typed = err.downcast_ref::<SqliteStatementError>().unwrap();
-		assert_eq!(typed.code, libsqlite3_sys::SQLITE_CONSTRAINT_UNIQUE);
-	}
-
-	#[test]
-	fn execute_single_statement_reports_malformed_sql() {
-		let db = MemoryDb::open();
-		let err = execute_single_statement(db.as_ptr(), "SELECT FROM", None)
-			.expect_err("malformed execute should fail");
-
-		assert!(
-			err.to_string().contains("failed to prepare"),
-			"unexpected error: {err:#}"
-		);
-	}
-}
+#[path = "../tests/inline/query.rs"]
+mod tests;

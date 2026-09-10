@@ -19,9 +19,13 @@ V8 dependency.
   disposable component Stores against a writer-fenced committed state/database version.
   They receive bounded `SELECT`-only SQL and cannot mutate state or emit effects.
 - All guest SQL denies Rivet/SQLite metadata and extension surfaces. SQL text, parameters,
-  rows, and result bytes are bounded before or during executor materialization.
-- Guest failure durably terminalizes the operation and discards the resident. An
-  uncertain commit fences the actor and also discards the resident.
+  rows, and result bytes are bounded before or during executor materialization. Native
+  execution also has scoped VM-work, deadline, structure, and per-value budgets. These
+  are not a total process-memory limit or hard preemption of native/VFS calls.
+- Guest failure durably terminalizes the operation and discards the resident. SQL
+  statement errors conservatively abort explicit transactions, including normally
+  recoverable constraint failures, to prevent SQLite automatic rollback escapes.
+  An uncertain commit fences the actor and also discards the resident.
 - Sandboxed WASI Preview 2 uses closed/sink stdio, no args or environment, no
   filesystem preopens, and deny-by-default networking. WASI HTTP is not linked.
 - Hibernating connection open/close callbacks are reserved transactional commands.
@@ -36,8 +40,10 @@ V8 dependency.
   Alarm writer admission is acknowledged, every generation idempotently resubmits the
   persisted alarm, and failed synchronization retries while keeping the actor awake.
 - Effect-producing commands are backpressured at a bounded pending-operation limit, while
-  unprotected terminal operations are compacted after every delivery attempt. Committed
-  destruction bypasses effect backpressure so deletion remains available.
+  unprotected terminal results are compacted after every delivery attempt. Permanent
+  identity tombstones prevent replay after result expiry; identity storage grows with
+  lifetime operations. Committed destruction bypasses effect backpressure so deletion
+  remains available.
 - Committed destruction establishes the local admission fence before replying. The
   durable destroy intent remains pending until engine-owned destruction removes the actor.
 - Raw HTTP, queues, raw WebSockets, subscriptions, and generic disconnect events fail
@@ -46,6 +52,20 @@ V8 dependency.
 The component ABI is defined in [`wit/cell.wit`](wit/cell.wit). A production
 component may embed ComponentizeJS/StarlingMonkey (SpiderMonkey in Wasm) or another
 component-compatible guest language. Wasmtime itself does not execute JavaScript.
+
+## Integration status
+
+This crate is an execution primitive, not the complete Wonderful Cells product adapter.
+The checked-in component fixture is Rust. The current production-path test uses bespoke
+BARE HTTP actions and receives managed socket output; it does not prove compatibility
+with Wonderful's TypeScript execution manifests or its strict JSON WebSocket protocol.
+A production bridge must implement class initialization/migration, capability dispatch,
+REST and socket lifecycle/message mapping, and authoritative deployment/auth policy.
+The WIT host currently exposes SQL only. Generic ActorConnect's JSON/CBOR argument
+encoding must not be treated as the internal BARE Cell action encoding.
+
+The action wire format and persisted schedule arguments use immutable generated v1/v2
+schemas in `action-schemas/`, explicit version converters, and golden compatibility tests.
 
 ## Test fixture
 

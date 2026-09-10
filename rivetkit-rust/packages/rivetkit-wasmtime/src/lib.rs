@@ -14,7 +14,7 @@ use rivetkit_core::{
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use tokio::sync::{Mutex, Notify, RwLock, Semaphore};
+use tokio::sync::{Mutex, Notify, OwnedRwLockReadGuard, RwLock, Semaphore};
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 use vbare::OwnedVersionedData;
@@ -42,8 +42,8 @@ mod bindings {
 	});
 }
 
-const ACTION_ENVELOPE_VERSION_V1: u16 = 1;
-const ACTION_ENVELOPE_VERSION: u16 = 2;
+mod action_protocol;
+pub use action_protocol::{CellActionEnvelope, CellMethodMode};
 const DEFAULT_MAX_BUNDLE_BYTES: usize = 8 * 1024 * 1024;
 const DEFAULT_MAX_MANIFEST_BYTES: usize = 256 * 1024;
 const DEFAULT_MAX_STATE_BYTES: usize = 256 * 1024;
@@ -137,13 +137,6 @@ impl CellBundle {
 			bundle_sha256,
 		}
 	}
-}
-
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum CellMethodMode {
-	Command,
-	Query,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -289,6 +282,15 @@ fn bundle_digest(source: &[u8], manifest: &[u8]) -> [u8; 32] {
 	hasher.finalize().into()
 }
 
+// Call only while holding the runtime reader/writer gate. Direct scheduled and
+// lifecycle events bypass ActorTask's ordinary request admission checks.
+fn ensure_cell_execution_admitted(ctx: &rivetkit_core::ActorContext) -> Result<()> {
+	if ctx.is_destroy_requested() {
+		bail!("CELL_DESTROYED: Cell no longer accepts application work");
+	}
+	Ok(())
+}
+
 fn completion_timestamp(fallback: i64) -> i64 {
 	SystemTime::now()
 		.duration_since(UNIX_EPOCH)
@@ -317,70 +319,6 @@ impl StaticCellBundleLoader {
 impl CellBundleLoader for StaticCellBundleLoader {
 	async fn load(&self, _actor_id: &str) -> Result<CellBundle> {
 		Ok(self.bundle.clone())
-	}
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct CellActionEnvelope {
-	pub mode: CellMethodMode,
-	pub operation_id: String,
-	pub input: Vec<u8>,
-	pub started_at: i64,
-}
-
-#[derive(Deserialize, Serialize)]
-struct CellActionEnvelopeV1 {
-	operation_id: String,
-	input: Vec<u8>,
-	started_at: i64,
-}
-
-impl CellActionEnvelope {
-	fn decode_mode(bytes: &[u8]) -> Result<CellMethodMode> {
-		let mut cursor = std::io::Cursor::new(bytes);
-		let version: u16 =
-			serde_bare::from_reader(&mut cursor).context("decode Cell action envelope version")?;
-		match version {
-			ACTION_ENVELOPE_VERSION_V1 => Ok(CellMethodMode::Command),
-			ACTION_ENVELOPE_VERSION => {
-				serde_bare::from_reader(&mut cursor).context("decode Cell action envelope mode")
-			}
-			_ => bail!("unsupported Cell action envelope version {version}"),
-		}
-	}
-
-	pub fn encode(&self) -> Result<Vec<u8>> {
-		let mut bytes = Vec::new();
-		serde_bare::to_writer(&mut bytes, &ACTION_ENVELOPE_VERSION)
-			.context("encode Cell action envelope version")?;
-		serde_bare::to_writer(&mut bytes, self).context("encode Cell action envelope")?;
-		Ok(bytes)
-	}
-
-	pub fn decode(bytes: &[u8]) -> Result<Self> {
-		let mut cursor = std::io::Cursor::new(bytes);
-		let version: u16 =
-			serde_bare::from_reader(&mut cursor).context("decode Cell action envelope version")?;
-		let envelope = match version {
-			ACTION_ENVELOPE_VERSION_V1 => {
-				let legacy: CellActionEnvelopeV1 = serde_bare::from_reader(&mut cursor)
-					.context("decode Cell action envelope v1")?;
-				Self {
-					operation_id: legacy.operation_id,
-					input: legacy.input,
-					started_at: legacy.started_at,
-					mode: CellMethodMode::Command,
-				}
-			}
-			ACTION_ENVELOPE_VERSION => {
-				serde_bare::from_reader(&mut cursor).context("decode Cell action envelope v2")?
-			}
-			_ => bail!("unsupported Cell action envelope version {version}"),
-		};
-		if usize::try_from(cursor.position()).unwrap_or(usize::MAX) != bytes.len() {
-			bail!("Cell action envelope contains trailing bytes");
-		}
-		Ok(envelope)
 	}
 }
 
@@ -545,6 +483,7 @@ impl WonderfulWasmtimeActorFactory {
 									args,
 								)
 								.await;
+							drop(_writer);
 							match outcome {
 								ActionOutcome::Reply(result) => {
 									if let Err(error) = &result {
@@ -584,11 +523,12 @@ impl WonderfulWasmtimeActorFactory {
 							let runtime = self.clone();
 							let ctx = ctx.clone();
 							let bundle = bundle.clone();
-							let reader = Arc::clone(&execution_gate).read_owned().await;
+							let reader = Arc::new(Arc::clone(&execution_gate).read_owned().await);
 							queries.spawn(async move {
 								let _query_slot = query_slot;
-								let _reader = reader;
-								let result = runtime.invoke_query(&ctx, &bundle, name, args).await;
+								let result = runtime
+									.invoke_query(&ctx, &bundle, name, args, reader)
+									.await;
 								reply.send(result);
 							});
 						}
@@ -609,8 +549,8 @@ impl WonderfulWasmtimeActorFactory {
 					if request_connections.remove(conn.id()) {
 						continue;
 					}
-					let _writer = execution_gate.write().await;
-					match self
+					let writer = execution_gate.write().await;
+					let outcome = self
 						.invoke_socket_lifecycle(
 							&ctx,
 							generation,
@@ -620,8 +560,9 @@ impl WonderfulWasmtimeActorFactory {
 							SOCKET_CLOSE_METHOD,
 							None,
 						)
-						.await
-					{
+						.await;
+					drop(writer);
+					match outcome {
 						ActionOutcome::Reply(Ok(_)) => effect_notify.notify_one(),
 						ActionOutcome::Reply(Err(error)) => {
 							tracing::warn!(connection_id = %conn.id(), ?error, "Wonderful Cell socket close handler failed");
@@ -658,24 +599,35 @@ impl WonderfulWasmtimeActorFactory {
 					protocol,
 					reply,
 					..
-				} => match protocol {
-					ConnectionProtocol::ActorConnect => reply.send(Ok(())),
-					ConnectionProtocol::Request => {
-						request_connections.insert(conn.id().to_owned());
-						reply.send(Ok(()));
+				} => {
+					let _reader = execution_gate.read().await;
+					if let Err(error) = ensure_cell_execution_admitted(&ctx) {
+						reply.send(Err(error));
+						continue;
 					}
-					ConnectionProtocol::RawWebSocket => reply.send(Err(anyhow!(
-						"raw WebSockets are not supported by the transactional Cell runtime"
-					))),
-				},
+					match protocol {
+						ConnectionProtocol::ActorConnect => reply.send(Ok(())),
+						ConnectionProtocol::Request => {
+							request_connections.insert(conn.id().to_owned());
+							reply.send(Ok(()));
+						}
+						ConnectionProtocol::RawWebSocket => reply.send(Err(anyhow!(
+							"raw WebSockets are not supported by the transactional Cell runtime"
+						))),
+					}
+				}
 				ActorEvent::ConnectionOpen {
 					conn, mut reply, ..
 				} => {
+					let _writer = execution_gate.write().await;
+					if let Err(error) = ensure_cell_execution_admitted(&ctx) {
+						reply.send(Err(error));
+						continue;
+					}
 					if request_connections.contains(conn.id()) {
 						reply.send(Ok(()));
 						continue;
 					}
-					let _writer = execution_gate.write().await;
 					let cancellation = CancellationToken::new();
 					let mut lifecycle = Box::pin(self.invoke_socket_lifecycle(
 						&ctx,
@@ -691,6 +643,7 @@ impl WonderfulWasmtimeActorFactory {
 						_ = reply.closed() => {
 							cancellation.cancel();
 							let outcome = lifecycle.await;
+							drop(_writer);
 							match outcome {
 								ActionOutcome::Fence(error) => {
 									queries.abort_all();
@@ -708,6 +661,8 @@ impl WonderfulWasmtimeActorFactory {
 						}
 						outcome = &mut lifecycle => outcome,
 					};
+					drop(lifecycle);
+					drop(_writer);
 					match outcome {
 						ActionOutcome::Reply(result) => {
 							reply.send(result.map(|_| ()));
@@ -784,7 +739,9 @@ impl WonderfulWasmtimeActorFactory {
 		bundle: &CellBundle,
 		name: String,
 		args: Vec<u8>,
+		reader: Arc<OwnedRwLockReadGuard<()>>,
 	) -> Result<Vec<u8>> {
+		ensure_cell_execution_admitted(ctx)?;
 		let envelope = CellActionEnvelope::decode(&args)?;
 		if envelope.mode != CellMethodMode::Query {
 			bail!("CELL_METHOD_MODE_MISMATCH: query was not encoded as read-only");
@@ -807,7 +764,11 @@ impl WonderfulWasmtimeActorFactory {
 		)
 		.await?;
 		let output = replica
-			.invoke(&name, &envelope.input, SqlCapability::ReadOnly(ctx.clone()))
+			.invoke(
+				&name,
+				&envelope.input,
+				SqlCapability::ReadOnly(ctx.clone(), reader),
+			)
 			.await?;
 		validate_output(&output, &self.limits)?;
 		if output.state != snapshot || !output.effects.is_empty() || output.destroyed {
@@ -840,6 +801,9 @@ impl WonderfulWasmtimeActorFactory {
 		args: Vec<u8>,
 		cancellation: Option<&CancellationToken>,
 	) -> ActionOutcome {
+		if let Err(error) = ensure_cell_execution_admitted(ctx) {
+			return ActionOutcome::Reply(Err(error));
+		}
 		let envelope = match CellActionEnvelope::decode(&args) {
 			Ok(envelope) => envelope,
 			Err(error) => return ActionOutcome::Reply(Err(error)),
@@ -1067,7 +1031,11 @@ impl WonderfulWasmtimeActorFactory {
 							// Remote actor-local SQLite is one connection. Keep effect scans,
 							// delivery acknowledgements, and compaction out of command/query
 							// transactions by sharing the runtime's writer fence.
-							let _writer = execution_gate.write().await;
+							let _writer = tokio::select! {
+								biased;
+								_ = cancel.cancelled() => return true,
+								writer = execution_gate.write() => writer,
+							};
 							let delivery = Self::deliver_pending_effect_batch(&ctx).await;
 							if let Err(error) = ctx
 								.compact_transactional_operations(max_transactional_operations)
@@ -1459,12 +1427,14 @@ struct GuestEffect {
 enum SqlCapability {
 	Unavailable,
 	Transactional(Arc<Mutex<Option<TransactionalOperation>>>),
-	ReadOnly(rivetkit_core::ActorContext),
+	ReadOnly(rivetkit_core::ActorContext, Arc<OwnedRwLockReadGuard<()>>),
 }
 
 struct HostState {
 	limits: StoreLimits,
 	sql_capability: SqlCapability,
+	command_deadline_unix_ms: u64,
+	pending_query_sql: Option<tokio::task::JoinHandle<Result<rivetkit_core::ExecuteResult>>>,
 	query_mutation_violation: bool,
 	sql_policy_violation: bool,
 	sql_limit_violation: bool,
@@ -1500,6 +1470,7 @@ impl bindings::wonderful::cells::host::Host for HostState {
 			sql,
 			self.runtime_limits.max_sql_rows,
 			self.runtime_limits.max_sql_result_bytes,
+			self.command_deadline_unix_ms,
 		);
 		let result = match &self.sql_capability {
 			SqlCapability::Transactional(active) => {
@@ -1512,18 +1483,29 @@ impl bindings::wonderful::cells::host::Host for HostState {
 					.await
 					.map_err(|error| format!("{error:#}"))?
 			}
-			SqlCapability::ReadOnly(ctx) => {
+			SqlCapability::ReadOnly(ctx, reader) => {
 				if let Err(error) = validate_read_only_sql(&sql, &params, &self.runtime_limits) {
 					self.query_mutation_violation = true;
 					return Err(format!("CELL_QUERY_MUTATION_VIOLATION: {error}"));
 				}
-				tokio::time::timeout(
-					self.runtime_limits.command_timeout,
-					ctx.sql().execute(sql, Some(params)),
-				)
-				.await
-				.map_err(|_| "CELL_QUERY_TIMEOUT: query SQL exceeded its deadline".to_owned())?
-				.map_err(|error| format!("{error:#}"))?
+				let ctx = ctx.clone();
+				let reader = Arc::clone(reader);
+				// Retain the committed-version fence until the executor confirms
+				// termination, even if the guest or query task is cancelled.
+				let execution = tokio::spawn(async move {
+					let _reader = reader;
+					ctx.sql().execute(sql, Some(params)).await
+				});
+				self.pending_query_sql = Some(execution);
+				let result = self
+					.pending_query_sql
+					.as_mut()
+					.expect("query SQL task installed")
+					.await;
+				self.pending_query_sql.take();
+				result
+					.map_err(|error| format!("query SQL task terminated: {error}"))?
+					.map_err(|error| format!("{error:#}"))?
 			}
 			SqlCapability::Unavailable => {
 				return Err("SQL is unavailable outside an active method".to_owned());
@@ -1612,8 +1594,15 @@ fn validate_read_only_sql(
 	Ok(())
 }
 
-fn sql_with_result_limits(sql: String, max_rows: usize, max_bytes: usize) -> String {
-	format!("/*rivet-result-limits:{max_rows}:{max_bytes}*/{sql}")
+fn sql_with_result_limits(
+	sql: String,
+	max_rows: usize,
+	max_bytes: usize,
+	deadline_unix_ms: u64,
+) -> String {
+	// The executor owns the conservative native work ceiling. This absolute
+	// deadline also counts time spent queued before SQLite begins execution.
+	format!("/*rivet-result-limits:{max_rows}:{max_bytes}:{deadline_unix_ms}:1000000*/{sql}")
 }
 
 fn validate_sql_result(
@@ -1725,6 +1714,7 @@ impl Resident {
 		input: Option<Vec<u8>>,
 		limits: WonderfulWasmtimeLimits,
 	) -> Result<Self> {
+		let activation_deadline = tokio::time::Instant::now() + limits.activation_timeout;
 		if initial_state.len() > limits.max_state_bytes {
 			bail!("Cell state exceeds configured activation limit");
 		}
@@ -1740,6 +1730,8 @@ impl Resident {
 			HostState {
 				limits: store_limits,
 				sql_capability: SqlCapability::Unavailable,
+				command_deadline_unix_ms: 0,
+				pending_query_sql: None,
 				query_mutation_violation: false,
 				sql_policy_violation: false,
 				sql_limit_violation: false,
@@ -1750,6 +1742,9 @@ impl Resident {
 		);
 		store.limiter(|state| &mut state.limits);
 		store.set_fuel(limits.fuel_per_activation)?;
+		// Fuel caps total instructions; periodic yields let Tokio enforce deadlines
+		// and make progress on other actors even when guest code never calls a host.
+		store.fuel_async_yield_interval(Some(10_000))?;
 		let mut linker = Linker::new(&engine);
 		wasmtime_wasi::p2::add_to_linker_async(&mut linker)
 			.map_err(|error| anyhow!("link sandboxed WASI interfaces: {error}"))?;
@@ -1757,11 +1752,15 @@ impl Resident {
 			&mut linker,
 			|state| state,
 		)?;
-		let bindings = bindings::Cell::instantiate_async(&mut store, &component, &linker)
-			.await
-			.map_err(|error| anyhow!("instantiate Wonderful Cell component: {error}"))?;
-		let activation = tokio::time::timeout(
-			limits.activation_timeout,
+		let bindings = tokio::time::timeout_at(
+			activation_deadline,
+			bindings::Cell::instantiate_async(&mut store, &component, &linker),
+		)
+		.await
+		.context("Cell component instantiation timed out")?
+		.map_err(|error| anyhow!("instantiate Wonderful Cell component: {error}"))?;
+		let activation = tokio::time::timeout_at(
+			activation_deadline,
 			bindings.wonderful_cells_guest().call_activate(
 				&mut store,
 				&bundle.source,
@@ -1790,6 +1789,13 @@ impl Resident {
 		sql_capability: SqlCapability,
 	) -> Result<GuestOutput> {
 		self.store.set_fuel(self.limits.fuel_per_command)?;
+		self.store.data_mut().command_deadline_unix_ms = u64::try_from(
+			SystemTime::now()
+				.duration_since(UNIX_EPOCH)?
+				.as_millis()
+				.saturating_add(self.limits.command_timeout.as_millis()),
+		)
+		.context("Cell command deadline exceeds timestamp range")?;
 		self.store.data_mut().sql_capability = sql_capability;
 		self.store.data_mut().query_mutation_violation = false;
 		self.store.data_mut().sql_policy_violation = false;
@@ -1801,6 +1807,12 @@ impl Resident {
 				.call_invoke_command(&mut self.store, name, input),
 		)
 		.await;
+		// A timed-out guest can leave a host SQL call in flight. Drain it before
+		// returning the query outcome; its task also owns the read fence if this
+		// entire future is aborted during shutdown.
+		if let Some(execution) = self.store.data_mut().pending_query_sql.take() {
+			let _ = execution.await;
+		}
 		let query_mutation_violation = self.store.data().query_mutation_violation;
 		let sql_policy_violation = self.store.data().sql_policy_violation;
 		let sql_limit_violation = self.store.data().sql_limit_violation;
@@ -2066,6 +2078,10 @@ fn validate_output(output: &GuestOutput, limits: &WonderfulWasmtimeLimits) -> Re
 }
 
 #[cfg(test)]
+#[path = "../tests/modules/runtime_architecture.rs"]
+mod architecture_tests;
+
+#[cfg(test)]
 mod tests {
 	use super::*;
 
@@ -2160,18 +2176,9 @@ mod tests {
 		invalid.push(0);
 		assert!(CellActionEnvelope::decode(&invalid).is_err());
 
-		let mut legacy =
-			serde_bare::to_vec(&ACTION_ENVELOPE_VERSION_V1).expect("encode legacy version");
-		legacy.extend(
-			serde_bare::to_vec(&CellActionEnvelopeV1 {
-				operation_id: "legacy-operation".to_owned(),
-				input: vec![4],
-				started_at: 7,
-			})
-			.expect("encode legacy envelope"),
-		);
+		let legacy = b"\x01\x00\x10legacy-operation\x01\x04\x07\x00\x00\x00\x00\x00\x00\x00";
 		assert_eq!(
-			CellActionEnvelope::decode(&legacy).expect("decode legacy envelope"),
+			CellActionEnvelope::decode(legacy).expect("decode legacy envelope"),
 			CellActionEnvelope {
 				operation_id: "legacy-operation".to_owned(),
 				input: vec![4],
@@ -2373,6 +2380,85 @@ mod tests {
 			vec![7],
 		);
 		assert!(ctx.is_destroy_requested());
+		for (name, mode) in [
+			("echo", CellMethodMode::Command),
+			("read", CellMethodMode::Query),
+			("sql", CellMethodMode::Command),
+		] {
+			let (late_tx, late_rx) = oneshot::channel();
+			event_tx
+				.send(ActorEvent::Action {
+					name: name.to_owned(),
+					args: CellActionEnvelope {
+						operation_id: if name == "sql" {
+							"schedule:late-sql".to_owned()
+						} else {
+							format!("late-{name}")
+						},
+						input: vec![9],
+						started_at: 101,
+						mode,
+					}
+					.encode()
+					.unwrap(),
+					conn: None,
+					scheduled_fire: (name == "sql").then(|| {
+						rivetkit_core::actor::schedule::ScheduledFireInfo {
+							kind: rivetkit_core::actor::schedule::ScheduleKind::At,
+							id: "late-sql".to_owned(),
+							name: None,
+							scheduled_at: 100,
+							fired_at: 101,
+						}
+					}),
+					reply: Reply::from(late_tx),
+				})
+				.unwrap();
+			assert!(
+				late_rx.await.unwrap().is_err(),
+				"direct {name} must be fenced"
+			);
+			assert!(
+				ctx.transactional_operation(&if name == "sql" {
+					"schedule:late-sql".to_owned()
+				} else {
+					format!("late-{name}")
+				})
+				.await
+				.unwrap()
+				.is_none()
+			);
+		}
+		let (connection, _messages) = testing::add_connection(&ctx, "late-connection", true);
+		let (open_tx, open_rx) = oneshot::channel();
+		event_tx
+			.send(ActorEvent::ConnectionOpen {
+				conn: connection.clone(),
+				request: None,
+				reply: Reply::from(open_tx),
+			})
+			.unwrap();
+		assert!(open_rx.await.unwrap().is_err());
+		event_tx
+			.send(ActorEvent::ConnectionClosed { conn: connection })
+			.unwrap();
+		// A FIFO state request provides a barrier after the no-reply close event.
+		let (barrier_tx, barrier_rx) = oneshot::channel();
+		event_tx
+			.send(ActorEvent::SerializeState {
+				reason: rivetkit_core::SerializeStateReason::Save,
+				reply: Reply::from(barrier_tx),
+			})
+			.unwrap();
+		barrier_rx.await.unwrap().unwrap();
+		for method in [SOCKET_CONNECT_METHOD, SOCKET_CLOSE_METHOD] {
+			assert!(
+				ctx.transactional_operation(&format!("socket:1:{method}:late-connection"))
+					.await
+					.unwrap()
+					.is_none()
+			);
+		}
 		assert!(
 			ctx.has_pending_transactional_effect_kind(DESTROY_EFFECT)
 				.await

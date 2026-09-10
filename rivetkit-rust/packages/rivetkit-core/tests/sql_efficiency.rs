@@ -596,11 +596,12 @@ fn query_catalog() -> Vec<QueryCase> {
 		QueryCase {
 			id: "schedule.claim_one_shot",
 			sql: queries::CLAIM_ONE_SHOT_SCHEDULE_SQL.into(),
+			// Use a row not removed by schedule.cancel so runtime metrics cover RETURNING.
 			params: vec![
 				5_i64.into(),
-				text("at:00000000"),
+				text("at:00000003"),
 				0_i64.into(),
-				0_i64.into(),
+				3_i64.into(),
 			],
 			expectation: indexed(None, all_schedules),
 		},
@@ -608,9 +609,9 @@ fn query_catalog() -> Vec<QueryCase> {
 			id: "schedule.complete_one_shot",
 			sql: queries::COMPLETE_ONE_SHOT_SCHEDULE_SQL.into(),
 			params: vec![
-				text("at:00000000"),
+				text("at:00000003"),
 				0_i64.into(),
-				0_i64.into(),
+				3_i64.into(),
 				5_i64.into(),
 			],
 			expectation: indexed(None, all_schedules),
@@ -857,6 +858,16 @@ fn sql_efficiency_hot_paths_do_not_scale_with_unrelated_rows() {
 			queries::TAKE_DUE_SCHEDULES_SQL.to_owned(),
 			vec![Value::Integer(5)],
 		),
+		(
+			"schedule.claim_one_shot",
+			queries::CLAIM_ONE_SHOT_SCHEDULE_SQL.to_owned(),
+			vec![
+				5_i64.into(),
+				text("at:00000003"),
+				0_i64.into(),
+				3_i64.into(),
+			],
+		),
 	];
 	for (id, sql, params) in cases {
 		let small = measured_vm_steps(100, &sql, &params);
@@ -865,6 +876,76 @@ fn sql_efficiency_hot_paths_do_not_scale_with_unrelated_rows() {
 			large <= small.saturating_mul(3).saturating_add(100),
 			"{id} scales with unrelated cardinality: small={small}, large={large}"
 		);
+	}
+}
+
+#[test]
+fn sql_efficiency_permanent_operation_identities_use_point_lookups() {
+	let mut small_steps = Vec::new();
+	for row_count in [100, REPRESENTATIVE_ROWS] {
+		let mut db = fixture(row_count);
+		let tx = db.transaction().expect("begin identity seed");
+		{
+			let mut insert = tx
+				.prepare("INSERT INTO _rivet_operation_tombstones (operation_id, input_digest) VALUES (?, zeroblob(32))")
+				.expect("prepare identity seed");
+			for index in 0..row_count {
+				insert
+					.execute([format!("expired:{index:08}")])
+					.expect("seed identity");
+			}
+		}
+		tx.commit().expect("commit identity seed");
+		db.execute_batch("ANALYZE")
+			.expect("analyze permanent identity index");
+
+		// The permanent index is not bounded by result retention. Hot admission
+		// work must not scale with the actor's lifetime number of operations.
+		let mut cases = Vec::new();
+		for operation_id in ["expired:00000050", "new-operation"] {
+			cases.push(QueryCase {
+				id: "transactional.load_tombstone",
+				sql: queries::LOAD_TRANSACTIONAL_OPERATION_TOMBSTONE_SQL.into(),
+				params: vec![text(operation_id)],
+				expectation: indexed(Some("primary key"), &["_rivet_operation_tombstones"]),
+			});
+			cases.push(QueryCase {
+				id: "transactional.admission_identity_check",
+				sql: queries::INSERT_TRANSACTIONAL_OPERATION_SQL.into(),
+				params: vec![
+					text(operation_id),
+					Value::Blob(vec![0; 32]),
+					0_i64.into(),
+					text("run"),
+					Value::Blob(vec![1]),
+					1_i64.into(),
+					10_000_i64.into(),
+				],
+				expectation: indexed(
+					Some("primary key"),
+					&["_rivet_operations", "_rivet_operation_tombstones"],
+				),
+			});
+		}
+		for (index, case) in cases.into_iter().enumerate() {
+			let plan = explain_plan(&db, &case.sql, &case.params);
+			assert_query_plan(case.id, &plan, &case.expectation).unwrap();
+			let metrics = execute_with_status(&db, &case.sql, &case.params);
+			assert_eq!(metrics.fullscan_steps, 0, "{}: {metrics:?}", case.id);
+			assert_eq!(metrics.sorts, 0, "{}: {metrics:?}", case.id);
+			assert_eq!(metrics.auto_indexes, 0, "{}: {metrics:?}", case.id);
+			if row_count == 100 {
+				small_steps.push(metrics.vm_steps);
+			} else {
+				assert!(
+					metrics.vm_steps <= small_steps[index] * 3 + 100,
+					"{} scales with lifetime operations: small={}, large={}",
+					case.id,
+					small_steps[index],
+					metrics.vm_steps,
+				);
+			}
+		}
 	}
 }
 

@@ -5,9 +5,9 @@
 mod integration_ctx;
 
 use std::collections::BTreeMap;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
@@ -15,21 +15,120 @@ use futures_util::StreamExt;
 use integration_ctx::IntegrationCtx;
 use reqwest::{Client, StatusCode};
 use rivetkit_client_protocol as client_protocol;
-use rivetkit_core::{ActorConfig, CanHibernateWebSocket, CoreRegistry};
+use rivetkit_core::{
+	ActorActionMode, ActorConfig, ActorEvent, ActorEvents, ActorFactory, CanHibernateWebSocket,
+	CoreRegistry, Reply,
+};
 use rivetkit_wasmtime::{
 	CellActionEnvelope, CellBundle, CellBundleLoader, CellMethodMode, CellRuntimeManifest,
-	WonderfulWasmtimeActorFactory, WonderfulWasmtimeLimits,
+	StaticCellBundleLoader, WonderfulWasmtimeActorFactory, WonderfulWasmtimeLimits,
 };
 use serde::Deserialize;
 use tokio::net::TcpStream;
+use tokio::sync::{Notify, mpsc, oneshot};
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::protocol::Message;
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async};
 use vbare::OwnedVersionedData;
 
 const ACTOR_NAME: &str = "wonderful-cell-fault-model";
+const LEGACY_ACTOR_NAME: &str = "wonderful-cell-legacy-schedule";
 const TEST_COMPONENT: &[u8] = include_bytes!("fixtures/wonderful_cell_test_guest.component.wasm");
 type TestSocket = WebSocketStream<MaybeTlsStream<TcpStream>>;
+// Envoy's GLOBAL_ENVOY slot permits one live registry endpoint per process.
+// Separate real-engine scenarios must release it before the next starts.
+static ENGINE_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+#[derive(Default)]
+struct LostReplyFault {
+	injected: AtomicBool,
+	committed: Notify,
+	disconnect: Notify,
+}
+
+struct AbortForwarderOnDrop(tokio::task::AbortHandle);
+
+impl Drop for AbortForwarderOnDrop {
+	fn drop(&mut self) {
+		self.0.abort();
+	}
+}
+
+// This test-only transport proxy leaves the real Wasmtime runtime and SQLite
+// transactions unchanged. It loses one successful reply after the runtime has
+// committed, while the public HTTP request is still in flight.
+fn with_lost_reply_fault(factory: ActorFactory, fault: Arc<LostReplyFault>) -> ActorFactory {
+	let config = factory.config().clone();
+	let factory = Arc::new(factory);
+	ActorFactory::new_with_manual_startup_ready(config, move |mut start| {
+		let factory = factory.clone();
+		let fault = fault.clone();
+		Box::pin(async move {
+			let (forward_tx, forward_rx) = mpsc::unbounded_channel();
+			let mut original = std::mem::replace(&mut start.events, ActorEvents::from(forward_rx));
+			let forwarder = tokio::spawn(async move {
+				let mut pending = tokio::task::JoinSet::new();
+				while let Some(event) = original.recv().await {
+					match event {
+						ActorEvent::Action {
+							name,
+							args,
+							conn,
+							scheduled_fire,
+							reply,
+						} if CellActionEnvelope::decode(&args).is_ok_and(|envelope| {
+							envelope.operation_id == "deduplicated-command"
+						}) && !fault.injected.swap(true, Ordering::SeqCst) =>
+						{
+							let (committed_tx, committed_rx) = oneshot::channel();
+							if forward_tx
+								.send(ActorEvent::Action {
+									name,
+									args,
+									conn,
+									scheduled_fire,
+									reply: Reply::from(committed_tx),
+								})
+								.is_err()
+							{
+								break;
+							}
+							let fault = fault.clone();
+							pending.spawn(async move {
+								match committed_rx.await {
+									Ok(Ok(_)) => {
+										fault.committed.notify_one();
+										fault.disconnect.notified().await;
+										drop(reply);
+									}
+									Ok(Err(error)) => reply.send(Err(error)),
+									Err(_) => drop(reply),
+								}
+							});
+						}
+						other => {
+							if forward_tx.send(other).is_err() {
+								break;
+							}
+						}
+					}
+				}
+				pending.abort_all();
+				while pending.join_next().await.is_some() {}
+			});
+			let _abort_forwarder = AbortForwarderOnDrop(forwarder.abort_handle());
+			let outcome = factory.start(start).await;
+			forwarder.abort();
+			let _ = forwarder.await;
+			outcome
+		})
+	})
+	.with_transactional_operations()
+	.with_action_classifier(|_, args| match CellActionEnvelope::decode(args) {
+		Ok(envelope) if envelope.mode == CellMethodMode::Query => ActorActionMode::Concurrent,
+		Ok(_) | Err(_) => ActorActionMode::Transactional,
+	})
+}
 
 #[derive(Debug, Deserialize, Eq, PartialEq)]
 struct SocketDeliveryEnvelope {
@@ -57,6 +156,7 @@ impl CellBundleLoader for CountingBundleLoader {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn wonderful_cells_survive_production_fault_boundaries() -> Result<()> {
+	let _engine_test = ENGINE_TEST_LOCK.lock().await;
 	let mut ctx = IntegrationCtx::builder()
 		.actor_start_threshold_ms(10_000)
 		.start()
@@ -82,11 +182,46 @@ async fn wonderful_cells_survive_production_fault_boundaries() -> Result<()> {
 	let runtime = WonderfulWasmtimeActorFactory::new(
 		TEST_COMPONENT,
 		Arc::new(loader),
+		config.clone(),
+		WonderfulWasmtimeLimits::default(),
+	)?;
+	let legacy_runtime = WonderfulWasmtimeActorFactory::new(
+		TEST_COMPONENT,
+		Arc::new(StaticCellBundleLoader::new(test_bundle(
+			b"legacy schedule fixture",
+		))),
 		config,
 		WonderfulWasmtimeLimits::default(),
 	)?;
+	let legacy_factory = Arc::new(legacy_runtime.actor_factory());
+	let legacy_activations = Arc::new(AtomicUsize::new(0));
 	let mut registry = CoreRegistry::new();
 	registry.register(ACTOR_NAME, runtime.actor_factory());
+	registry.register(
+		LEGACY_ACTOR_NAME,
+		ActorFactory::new_with_manual_startup_ready(legacy_factory.config().clone(), {
+			let legacy_activations = legacy_activations.clone();
+			move |start| {
+				let factory = legacy_factory.clone();
+				let activations = legacy_activations.clone();
+				Box::pin(async move {
+					activations.fetch_add(1, Ordering::SeqCst);
+					if start.is_new {
+						let due = i64::try_from(
+							SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis(),
+						)? + 3_000;
+						// Literal historical v1 wire bytes. Persist through the real core
+						// scheduler before sleeping, then decode/fire in a later activation.
+						let legacy =
+							b"\x01\x00\x0fschedule:legacy\x01\x04\x07\x00\x00\x00\x00\x00\x00\x00";
+						start.ctx.at(due, "echo", legacy).await?;
+					}
+					factory.start(start).await
+				})
+			}
+		})
+		.with_transactional_operations(),
+	);
 	let registry_task = ctx.serve_registry(registry);
 
 	ctx.wait_for_envoy_ready().await?;
@@ -96,6 +231,20 @@ async fn wonderful_cells_survive_production_fault_boundaries() -> Result<()> {
 		.timeout(Duration::from_secs(15))
 		.build()
 		.context("build bounded production fault model client")?;
+	let legacy_actor = ctx.create_actor(LEGACY_ACTOR_NAME).await?;
+	assert!(
+		wait_for_cell_action(
+			&client,
+			&endpoint,
+			&legacy_actor.actor_id,
+			"read",
+			"legacy-initial",
+			CellMethodMode::Query,
+			Vec::new(),
+		)
+		.await?
+		.is_empty()
+	);
 
 	let first = wait_for_cell_action(
 		&client,
@@ -351,6 +500,122 @@ async fn wonderful_cells_survive_production_fault_boundaries() -> Result<()> {
 	ctx.wait_for_envoy_ready().await?;
 	wait_for_actor_rejected(&client, ctx.endpoint(), &actor.actor_id).await?;
 
+	assert_eq!(
+		wait_for_cell_action(
+			&client,
+			ctx.endpoint(),
+			&legacy_actor.actor_id,
+			"read",
+			"legacy-after-wake",
+			CellMethodMode::Query,
+			Vec::new(),
+		)
+		.await?,
+		vec![4],
+		"persisted v1 schedule must fire through the real scheduler exactly once"
+	);
+	assert!(
+		legacy_activations.load(Ordering::SeqCst) >= 2,
+		"legacy schedule actor must rehydrate after sleep"
+	);
+
+	registry_task.shutdown().await?;
+	ctx.shutdown().await?;
+	Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn committed_operation_survives_engine_loss_before_http_reply() -> Result<()> {
+	let _engine_test = ENGINE_TEST_LOCK.lock().await;
+	let mut ctx = IntegrationCtx::builder()
+		.actor_start_threshold_ms(10_000)
+		.start()
+		.await?;
+	ctx.create_default_namespace().await?;
+	let runtime = WonderfulWasmtimeActorFactory::new(
+		TEST_COMPONENT,
+		Arc::new(StaticCellBundleLoader::new(test_bundle(
+			b"lost-reply fixture",
+		))),
+		ActorConfig {
+			remote_sqlite: true,
+			sleep_timeout: Duration::from_secs(60),
+			..ActorConfig::default()
+		},
+		WonderfulWasmtimeLimits::default(),
+	)?;
+	let fault = Arc::new(LostReplyFault::default());
+	let mut registry = CoreRegistry::new();
+	registry.register(
+		ACTOR_NAME,
+		with_lost_reply_fault(runtime.actor_factory(), fault.clone()),
+	);
+	let registry_task = ctx.serve_registry(registry);
+	ctx.wait_for_envoy_ready().await?;
+	let actor = ctx.create_actor(ACTOR_NAME).await?;
+	let endpoint = ctx.endpoint().to_owned();
+	let client = Client::builder().timeout(Duration::from_secs(15)).build()?;
+	let lost_request = tokio::spawn({
+		let client = client.clone();
+		let endpoint = endpoint.clone();
+		let actor_id = actor.actor_id.clone();
+		async move {
+			cell_action(
+				&client,
+				&endpoint,
+				&actor_id,
+				"echo",
+				"deduplicated-command",
+				CellMethodMode::Command,
+				vec![1],
+			)
+			.await
+		}
+	});
+	tokio::time::timeout(Duration::from_secs(15), fault.committed.notified())
+		.await
+		.context("first operation must commit before fault injection")?;
+	// The runtime has committed but the gateway cannot yet receive its reply.
+	assert!(
+		!lost_request.is_finished(),
+		"fault must interrupt an in-flight request"
+	);
+	ctx.restart_engine().await?;
+	fault.disconnect.notify_one();
+	assert!(
+		lost_request
+			.await
+			.context("join interrupted HTTP request")?
+			.is_err()
+	);
+	ctx.wait_for_envoy_ready().await?;
+	assert_eq!(
+		wait_for_cell_action(
+			&client,
+			ctx.endpoint(),
+			&actor.actor_id,
+			"echo",
+			"deduplicated-command",
+			CellMethodMode::Command,
+			vec![1]
+		)
+		.await?,
+		vec![1]
+	);
+	assert_eq!(
+		wait_for_cell_action(
+			&client,
+			ctx.endpoint(),
+			&actor.actor_id,
+			"read",
+			"read-after-reply-loss",
+			CellMethodMode::Query,
+			Vec::new()
+		)
+		.await?,
+		vec![1],
+		"retry must not execute the committed command twice"
+	);
 	registry_task.shutdown().await?;
 	ctx.shutdown().await?;
 	Ok(())

@@ -38,6 +38,12 @@ a new instance and hydrates the last committed actor state.
 7. A guest error durably fails the operation, rolls back guest SQL, and discards the
    resident. Error codes/messages are bounded and sanitized before persistence.
 
+Application admission is checked under the runtime gate, including direct scheduled
+and connection lifecycle events that bypass ordinary RPC dispatch. Once destruction
+is fenced, only runtime cleanup/state plumbing remains admissible. Fencing releases
+its writer guard before joining the effect pump; cancellation may interrupt a pump
+waiting for the gate but never abandons an already-started delivery transaction.
+
 Guest destruction intent is persisted as the ordered
 `wonderful.cell.destroy` effect. Other guest effects retain guest order and receive
 the transactional core's `(commit_sequence, effect_index)` ordering.
@@ -54,9 +60,10 @@ fails if a guest requests any other undeclared capability.
 
 Raw HTTP, queue, raw WebSocket, subscription, and generic disconnect events remain
 rejected. Framework REST/RPC request connections are admitted only as ephemeral action
-context and do not invoke socket lifecycle methods. Managed ActorConnect preflight is
-admitted by the Wonderful transport policy; its connection open and close callbacks
-execute as reserved transactional commands. A failed open command rejects the
+context and do not invoke socket lifecycle methods. Managed ActorConnect connection
+open and close callbacks execute as reserved transactional commands. This primitive
+does not itself implement Wonderful ticket, origin, tenant, or deployment policy;
+those checks must be supplied by the production integration. A failed open command rejects the
 connection. Hibernatable connections therefore do
 not keep the actor resident, and wake recreates the component from committed state.
 
@@ -75,11 +82,14 @@ Guest output uses bounded `vbare::OwnedVersionedData` payloads generated from
 - `wonderful.cell.schedule.cancel` removes the stable schedule;
 - `wonderful.cell.destroy` requests actor destruction after commit.
 
-Inbound socket frames enter through the same versioned command envelope as other
-actions; their transport-assigned operation IDs are durably admitted before guest code
-runs and are never replayed once started. `socket:` and `schedule:` operation-ID
-prefixes are server-owned and rejected on external actions. Expired connection-open
-replies cancel the guest invocation and discard its Store before commit.
+Bespoke BARE ActorConnect callers can submit the internal versioned action envelope.
+Generic JSON/CBOR ActorConnect is not compatible with that inner encoding, and the
+current adapter does not map raw Wonderful JSON messages to `onMessage` or allocate
+transport-owned operation IDs for them. A dedicated integration is required; a raw
+u16 transport message index cannot serve as a permanent ID because it wraps.
+`socket:` and `schedule:` operation-ID prefixes are server-owned and rejected on
+external actions. Expired connection-open replies cancel the guest invocation and
+discard its Store before commit.
 
 A per-actor effect pump resumes pending effects on startup and after every command,
 delivers in commit/index order, records failed attempts, and retries with backoff while
@@ -97,7 +107,8 @@ synchronization failures install one actor-scoped retry that keeps the actor awa
 the local/engine alarm is armed. Every actor generation resubmits its persisted alarm
 because a prior Envoy acknowledgement proves only local writer admission. Due one-shot
 schedules remain durable until their action replies, closing the delete-before-admission
-crash window. A persisted one-shot claim token prevents completion of an old dispatch
+crash window. Claiming atomically returns the current row so a pre-claim replacement
+cannot dispatch an obsolete payload. A persisted one-shot claim token prevents completion of an old dispatch
 from deleting a same-ID/same-deadline replacement. Compaction runs after every effect
 attempt, and commands that would add effects are rejected once the bounded pending-effect
 operation limit is reached; a committed destruction request always bypasses that
@@ -114,7 +125,10 @@ Commands execute on the canonical resident under an exclusive writer gate. Queri
 hold a shared reader gate and create an independent component Store from the current
 committed state and transactional commit sequence. The reader gate keeps the state
 and actor-local database at that version until the query finishes. Query replicas
-never share the writer's heap and are discarded after one call.
+never share the writer's heap and are discarded after one call. This is whole-query
+writer exclusion, not MVCC or a separately copied SQLite snapshot. A query's native
+SQL task retains the reader guard until the executor returns, even when guest timeout
+or shutdown cancels the surrounding invocation.
 
 All guest SQL is bounded before execution and cannot reference `_rivet_*`, `sqlite_*`,
 dangerous pragmas, extension loading, or file functions. A trusted host prefix makes the
@@ -130,9 +144,22 @@ code.
 The factory enforces source/manifest/state/result/effect and SQL limits, aggregate effect
 bytes, bounded guest errors, per-actor query concurrency, explicit component instance/
 memory/table/table-element limits, fuel budgets for activation and each method, and a
-wall-clock method deadline. Terminal operation records are compacted to the configured
-newest-record bound; operations with pending effects remain protected. Fuel exhaustion and traps durably fail the operation
-and discard the resident.
+wall-clock method deadline. Fuel-based cooperative yielding lets the executor poll
+CPU-only guest deadlines. Activation uses one deadline spanning component instantiation
+and the activation export. The linear-memory limit is per memory, not a combined Store
+or process-memory limit; host and SQLite allocations are outside it.
+
+Guest SQL carries an absolute deadline to the executor, including queue time. The native
+executor additionally caps VM work, expression/statement structure and value size with
+scoped limits restored after each statement. These do not establish a total SQLite or
+process-memory quota; deployment memory limits remain necessary. Result collection
+limits alone are not an execution budget.
+
+Terminal operation results are compacted to the configured newest-record bound;
+operations with pending effects remain protected. Schema v3 retains minimal permanent
+identity tombstones so expired results reject retries instead of reexecuting. Identity
+storage grows with lifetime operations. Fuel exhaustion and traps durably fail the
+operation and discard the resident.
 
 ## Production-path fault validation
 
@@ -141,8 +168,19 @@ binary and serves a real `CoreRegistry` with this factory. It validates operatio
 deduplication, concurrent command serialization, immutable query snapshots,
 actor-local SQLite, bundle reload across sleep/wake, hibernating WebSocket restoration,
 ordered post-commit socket envelopes, engine process restart, state/SQLite recovery,
-and Cell-requested destruction. Build `rivet-engine` before running the test target.
+and Cell-requested destruction. A separate actor persists historical v1 schedule
+arguments, sleeps, rehydrates and fires them through the actual scheduler. Build
+`rivet-engine` before running the test target.
 Crate-local tests retain deterministic coverage for pre/post-commit failures and
 indeterminate storage outcomes that cannot yet be injected through the engine API.
+A separate deterministic fault test intercepts one successful runtime reply after
+aggregate commit, restarts the real engine while its HTTP request remains in flight,
+and loses the reply. Retrying the same ID must return the committed result without
+executing the command twice. This tests post-commit reply loss, not interruption
+inside SQLite COMMIT or the socket delivery/acknowledgement window. The broader
+lifecycle scenario also tests engine restart after sleep.
+The checked-in component is Rust and ignores bundle source; these tests are
+not proof of real TypeScript bundle execution, Wonderful JSON socket framing,
+platform capabilities, or live Wonderful deployment authorization.
 
 See also [Transactional actor consistency](transactional-actor-consistency.md).

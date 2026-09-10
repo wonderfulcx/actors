@@ -247,6 +247,13 @@ pub enum TransactionalOperationError {
 	OperationIdConflict { operation_id: String },
 
 	#[error(
+		"operation_result_expired",
+		"Actor operation result has expired and the operation cannot execute again.",
+		"Actor operation '{operation_id}' result has expired and the operation cannot execute again."
+	)]
+	OperationResultExpired { operation_id: String },
+
+	#[error(
 		"operation_in_progress",
 		"Actor operation is already in progress.",
 		"Actor operation '{operation_id}' is already in progress."

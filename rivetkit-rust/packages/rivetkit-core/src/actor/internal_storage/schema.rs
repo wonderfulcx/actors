@@ -3,7 +3,7 @@ use anyhow::{Context, Result, bail};
 use super::queries::{LOAD_META_TEXT_SQL, UPSERT_META_TEXT_SQL};
 use crate::sqlite::{BindParam, ColumnValue, SqliteBatchStatement, SqliteDb};
 
-pub(crate) const INTERNAL_SCHEMA_VERSION: i64 = 2;
+pub(crate) const INTERNAL_SCHEMA_VERSION: i64 = 3;
 
 const SCHEMA_VERSION_KEY: &str = "schema_version";
 
@@ -214,6 +214,48 @@ CREATE TABLE _rivet_transactional_runtime (
 		r#"
 INSERT INTO _rivet_transactional_runtime (id, next_commit_sequence)
 VALUES (1, 1)
+"#,
+	],
+	&[
+		// Result retention bounds terminal operation payloads, not execution identities.
+		// This minimal index grows with lifetime operations and must never be pruned.
+		// W[once per removed terminal result | point INSERT | operation ID plus 32-byte digest | permanent identity index]
+		r#"
+CREATE TABLE _rivet_operation_tombstones (
+    operation_id TEXT PRIMARY KEY,
+    input_digest BLOB NOT NULL
+) STRICT, WITHOUT ROWID
+"#,
+		// Capture identity in the deleting statement so compaction cannot open a
+		// gap in which an already executed ID becomes admissible again.
+		r#"
+CREATE TRIGGER _rivet_operations_retain_identity
+AFTER DELETE ON _rivet_operations
+WHEN OLD.status IN (1, 2, 3)
+BEGIN
+    INSERT INTO _rivet_operation_tombstones (operation_id, input_digest)
+    VALUES (OLD.operation_id, OLD.input_digest);
+END
+"#,
+		// Enforce the admission boundary even for an insert that omits the
+		// production query's tombstone predicate.
+		r#"
+CREATE TRIGGER _rivet_operations_reject_expired_identity
+BEFORE INSERT ON _rivet_operations
+WHEN EXISTS (
+    SELECT 1 FROM _rivet_operation_tombstones WHERE operation_id = NEW.operation_id
+)
+BEGIN
+    SELECT RAISE(IGNORE);
+END
+"#,
+		r#"
+CREATE TRIGGER _rivet_operations_preserve_started
+BEFORE DELETE ON _rivet_operations
+WHEN OLD.status = 0
+BEGIN
+    SELECT RAISE(ABORT, 'started transactional operations cannot be deleted');
+END
 "#,
 	],
 ];

@@ -32,12 +32,21 @@ replies only after `commit` or `fail` has completed.
 
 Operation IDs are idempotency keys. Reusing an ID with the same operation kind,
 name, and input returns its durable record. Reusing it with different input
-fails with `actor.operation_id_conflict`.
+fails with `actor.operation_id_conflict`. Result compaction retains a permanent minimal
+identity tombstone. A matching retry after result expiry fails with
+`actor.operation_result_expired` rather than executing again. Identity storage grows
+with lifetime operations; the retention setting bounds result payloads, not the
+number of identities.
 
 ## Failure and recovery
 
 Guest failures roll back the operation transaction, discard staged state and
-effects, and then persist a sanitized terminal failure. If terminal failure
+effects, and then persist a sanitized terminal failure. Any explicit-transaction SQL
+statement error conservatively rolls back and terminalizes that transaction under its
+operation lock, including otherwise recoverable constraint errors. The shared backend
+API does not expose autocommit state, so this policy prevents automatic SQLite rollback
+from turning subsequent guest or aggregate writes into autocommits. Catching the error
+does not make the transaction usable again. If terminal failure
 persistence fails, the operation remains `started` and no speculative result is
 safe to expose.
 
@@ -86,6 +95,13 @@ Internal schema v2 appends:
 The tables live in the same actor-local SQLite database as user SQL and actor
 state. Successful completion therefore uses `ActorStateTransaction`; it does
 not introduce a second transaction coordinator.
+
+Schema v3 adds `_rivet_operation_tombstones` and atomic deletion/admission triggers.
+It preserves execution identities when terminal results are removed and prohibits
+deleting Started rows. Migration cannot reconstruct IDs already pruned under v2;
+the permanent no-replay guarantee covers identities still present at migration and
+newly admitted operations. Downgrading to a runtime without schema-v3 support is not
+a supported rollback.
 
 ## Wasmtime runtime contract
 
