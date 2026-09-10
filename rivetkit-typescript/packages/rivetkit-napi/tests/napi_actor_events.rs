@@ -253,6 +253,7 @@ mod moved_tests {
 		dispatch_event(
 			ActorEvent::ConnectionPreflight {
 				conn: conn.clone(),
+				protocol: rivetkit_core::ConnectionProtocol::ActorConnect,
 				params: vec![4, 5, 6],
 				request: None,
 				reply: tx.into(),

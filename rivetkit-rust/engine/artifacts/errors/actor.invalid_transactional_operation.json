@@ -1,0 +1,5 @@
+{
+  "code": "invalid_transactional_operation",
+  "group": "actor",
+  "message": "Actor transactional operation is invalid."
+}

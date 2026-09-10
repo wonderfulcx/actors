@@ -122,6 +122,12 @@ fn fixture(row_count: usize) -> Connection {
 	let mut history_insert = tx
 		.prepare("INSERT INTO _rivet_schedule_history (schedule_id, action, scheduled_at, fired_at, finished_at, result) VALUES (?, 'run', ?, ?, ?, ?)")
 		.expect("prepare history seed");
+	let mut operation_insert = tx
+		.prepare("INSERT INTO _rivet_operations (operation_id, input_digest, kind, name, input, status, actor_generation, started_at, completed_at, commit_sequence, result, error_group, error_code, error_message, error_metadata) VALUES (?, x'01', 0, 'run', x'02', ?, 1, ?, ?, ?, x'03', NULL, NULL, NULL, NULL)")
+		.expect("prepare transactional operation seed");
+	let mut effect_insert = tx
+		.prepare("INSERT INTO _rivet_operation_effects (operation_id, effect_index, commit_sequence, kind, payload, status, attempts, last_attempted_at) VALUES (?, 0, ?, 'socket_send', x'03', ?, 0, NULL)")
+		.expect("prepare transactional effect seed");
 	for index in 0..row_count {
 		let key = format!("{index:08}");
 		conn_insert.execute([&key]).expect("seed connection");
@@ -152,6 +158,26 @@ fn fixture(row_count: usize) -> Connection {
 				if index % 997 == 0 { 0_i64 } else { 1_i64 },
 			))
 			.expect("seed schedule history");
+		let operation_id = format!("op:{key}");
+		let operation_status = if index % 997 == 0 { 1_i64 } else { 2_i64 };
+		operation_insert
+			.execute((
+				&operation_id,
+				operation_status,
+				index as i64,
+				index as i64,
+				index as i64 + 1,
+			))
+			.expect("seed transactional operation");
+		if index % 4 == 0 {
+			effect_insert
+				.execute((
+					&operation_id,
+					index as i64 + 1,
+					if index % 8 == 0 { 0_i64 } else { 1_i64 },
+				))
+				.expect("seed transactional effect");
+		}
 	}
 	drop(conn_insert);
 	drop(conn_state_insert);
@@ -159,6 +185,13 @@ fn fixture(row_count: usize) -> Connection {
 	drop(user_kv_insert);
 	drop(schedule_insert);
 	drop(history_insert);
+	drop(operation_insert);
+	drop(effect_insert);
+	tx.execute(
+		"UPDATE _rivet_transactional_runtime SET next_commit_sequence = ? WHERE id = 1",
+		[row_count as i64 + 1],
+	)
+	.expect("seed transactional runtime sequence");
 	tx.commit().expect("commit fixture seed");
 	db.execute_batch("ANALYZE").expect("analyze fixture");
 	db
@@ -245,7 +278,7 @@ fn execute_with_status(db: &Connection, sql: &str, params: &[Value]) -> Statemen
 	] {
 		statement.reset_status(status);
 	}
-	if statement.readonly() {
+	if statement.readonly() || statement.column_count() > 0 {
 		let mut rows = statement
 			.query(params_from_iter(params.iter()))
 			.expect("execute measured query");
@@ -561,16 +594,25 @@ fn query_catalog() -> Vec<QueryCase> {
 			expectation: indexed(Some("_rivet_schedule_events_trigger_at"), all_schedules),
 		},
 		QueryCase {
-			id: "schedule.claim_one_shots",
-			sql: queries::claim_one_shots_sql(3),
+			id: "schedule.claim_one_shot",
+			sql: queries::CLAIM_ONE_SHOT_SCHEDULE_SQL.into(),
+			// Use a row not removed by schedule.cancel so runtime metrics cover RETURNING.
 			params: vec![
-				0_i64.into(),
-				text("at:00000000"),
-				0_i64.into(),
+				5_i64.into(),
 				text("at:00000003"),
+				0_i64.into(),
 				3_i64.into(),
-				text("at:00000006"),
-				6_i64.into(),
+			],
+			expectation: indexed(None, all_schedules),
+		},
+		QueryCase {
+			id: "schedule.complete_one_shot",
+			sql: queries::COMPLETE_ONE_SHOT_SCHEDULE_SQL.into(),
+			params: vec![
+				text("at:00000003"),
+				0_i64.into(),
+				3_i64.into(),
+				5_i64.into(),
 			],
 			expectation: indexed(None, all_schedules),
 		},
@@ -647,6 +689,79 @@ fn query_catalog() -> Vec<QueryCase> {
 					bound: "periodic pruning retains 9,900 rows, leaving headroom beneath MAX_ACTOR_HISTORY",
 				}],
 			},
+		},
+		QueryCase {
+			id: "transactional.load_operation",
+			sql: queries::LOAD_TRANSACTIONAL_OPERATION_SQL.into(),
+			params: vec![text("op:00000050")],
+			expectation: indexed(None, &["_rivet_operations"]),
+		},
+		QueryCase {
+			id: "transactional.recover_started",
+			sql: queries::RECOVER_TRANSACTIONAL_OPERATIONS_SQL.into(),
+			params: vec![20_000_i64.into()],
+			expectation: indexed(
+				Some("_rivet_operations_status_started"),
+				&["_rivet_operations"],
+			),
+		},
+		QueryCase {
+			id: "transactional.pending_effects",
+			sql: queries::LOAD_PENDING_TRANSACTIONAL_EFFECTS_SQL.into(),
+			params: vec![32_i64.into()],
+			expectation: indexed(
+				Some("_rivet_operation_effects_pending"),
+				&["_rivet_operation_effects"],
+			),
+		},
+		QueryCase {
+			id: "transactional.count_pending_effect_operations",
+			sql: queries::COUNT_PENDING_TRANSACTIONAL_EFFECT_OPERATIONS_SQL.into(),
+			params: vec![],
+			expectation: bounded_scan(&[AllowedScan {
+				table: "_rivet_operations",
+				reason: "counting protected operations inspects each retained operation and probes its indexed effects",
+				bound: "runtime backlog admission and terminal-operation compaction bound retained operations",
+			}]),
+		},
+		QueryCase {
+			id: "transactional.ack_effect",
+			sql: queries::MARK_TRANSACTIONAL_EFFECT_DELIVERED_SQL.into(),
+			params: vec![20_000_i64.into(), text("op:00000000"), 0_i64.into()],
+			expectation: indexed(None, &["_rivet_operation_effects"]),
+		},
+		QueryCase {
+			id: "transactional.next_commit_sequence",
+			sql: queries::NEXT_TRANSACTIONAL_COMMIT_SEQUENCE_SQL.into(),
+			params: vec![],
+			expectation: indexed(None, &["_rivet_transactional_runtime"]),
+		},
+		QueryCase {
+			id: "transactional.upsert_named_schedule",
+			sql: queries::UPSERT_NAMED_SCHEDULE_EVENT_SQL.into(),
+			params: vec![
+				text("effect:schedule"),
+				20_000_i64.into(),
+				text("wake"),
+				Value::Blob(vec![1]),
+				0_i64.into(),
+			],
+			expectation: indexed(None, &["_rivet_schedule_events"]),
+		},
+		QueryCase {
+			id: "transactional.load_commit_sequence",
+			sql: queries::LOAD_TRANSACTIONAL_COMMIT_SEQUENCE_SQL.into(),
+			params: vec![],
+			expectation: indexed(None, &["_rivet_transactional_runtime"]),
+		},
+		QueryCase {
+			id: "transactional.prune",
+			sql: queries::PRUNE_TRANSACTIONAL_OPERATIONS_SQL.into(),
+			params: vec![5_000_i64.into(), 128_i64.into()],
+			expectation: indexed(
+				Some("_rivet_operations_terminal_retention"),
+				&["_rivet_operations", "_rivet_operation_effects"],
+			),
 		},
 		QueryCase {
 			id: "cleanup.select_chunk",
@@ -743,6 +858,16 @@ fn sql_efficiency_hot_paths_do_not_scale_with_unrelated_rows() {
 			queries::TAKE_DUE_SCHEDULES_SQL.to_owned(),
 			vec![Value::Integer(5)],
 		),
+		(
+			"schedule.claim_one_shot",
+			queries::CLAIM_ONE_SHOT_SCHEDULE_SQL.to_owned(),
+			vec![
+				5_i64.into(),
+				text("at:00000003"),
+				0_i64.into(),
+				3_i64.into(),
+			],
+		),
 	];
 	for (id, sql, params) in cases {
 		let small = measured_vm_steps(100, &sql, &params);
@@ -751,6 +876,76 @@ fn sql_efficiency_hot_paths_do_not_scale_with_unrelated_rows() {
 			large <= small.saturating_mul(3).saturating_add(100),
 			"{id} scales with unrelated cardinality: small={small}, large={large}"
 		);
+	}
+}
+
+#[test]
+fn sql_efficiency_permanent_operation_identities_use_point_lookups() {
+	let mut small_steps = Vec::new();
+	for row_count in [100, REPRESENTATIVE_ROWS] {
+		let mut db = fixture(row_count);
+		let tx = db.transaction().expect("begin identity seed");
+		{
+			let mut insert = tx
+				.prepare("INSERT INTO _rivet_operation_tombstones (operation_id, input_digest) VALUES (?, zeroblob(32))")
+				.expect("prepare identity seed");
+			for index in 0..row_count {
+				insert
+					.execute([format!("expired:{index:08}")])
+					.expect("seed identity");
+			}
+		}
+		tx.commit().expect("commit identity seed");
+		db.execute_batch("ANALYZE")
+			.expect("analyze permanent identity index");
+
+		// The permanent index is not bounded by result retention. Hot admission
+		// work must not scale with the actor's lifetime number of operations.
+		let mut cases = Vec::new();
+		for operation_id in ["expired:00000050", "new-operation"] {
+			cases.push(QueryCase {
+				id: "transactional.load_tombstone",
+				sql: queries::LOAD_TRANSACTIONAL_OPERATION_TOMBSTONE_SQL.into(),
+				params: vec![text(operation_id)],
+				expectation: indexed(Some("primary key"), &["_rivet_operation_tombstones"]),
+			});
+			cases.push(QueryCase {
+				id: "transactional.admission_identity_check",
+				sql: queries::INSERT_TRANSACTIONAL_OPERATION_SQL.into(),
+				params: vec![
+					text(operation_id),
+					Value::Blob(vec![0; 32]),
+					0_i64.into(),
+					text("run"),
+					Value::Blob(vec![1]),
+					1_i64.into(),
+					10_000_i64.into(),
+				],
+				expectation: indexed(
+					Some("primary key"),
+					&["_rivet_operations", "_rivet_operation_tombstones"],
+				),
+			});
+		}
+		for (index, case) in cases.into_iter().enumerate() {
+			let plan = explain_plan(&db, &case.sql, &case.params);
+			assert_query_plan(case.id, &plan, &case.expectation).unwrap();
+			let metrics = execute_with_status(&db, &case.sql, &case.params);
+			assert_eq!(metrics.fullscan_steps, 0, "{}: {metrics:?}", case.id);
+			assert_eq!(metrics.sorts, 0, "{}: {metrics:?}", case.id);
+			assert_eq!(metrics.auto_indexes, 0, "{}: {metrics:?}", case.id);
+			if row_count == 100 {
+				small_steps.push(metrics.vm_steps);
+			} else {
+				assert!(
+					metrics.vm_steps <= small_steps[index] * 3 + 100,
+					"{} scales with lifetime operations: small={}, large={}",
+					case.id,
+					small_steps[index],
+					metrics.vm_steps,
+				);
+			}
+		}
 	}
 }
 

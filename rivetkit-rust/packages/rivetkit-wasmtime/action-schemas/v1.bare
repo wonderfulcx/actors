@@ -1,0 +1,6 @@
+# The vbare header is a little-endian u16. Version 1 always invokes a command.
+type CellActionEnvelope struct {
+	operation_id: str
+	input: data
+	started_at: i64
+}

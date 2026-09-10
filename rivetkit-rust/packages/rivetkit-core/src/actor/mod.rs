@@ -27,15 +27,18 @@ pub mod sqlite;
 pub mod state;
 pub mod task;
 pub mod task_types;
+pub mod transactional;
 pub(crate) mod work_registry;
 
 pub use action::ActionDispatchError;
 #[cfg(feature = "sqlite-local")]
 pub use actor_runtime_socket::ActorRuntimeSocketEndpointInfo;
-pub use config::{ActionDefinition, ActorConfig, ActorConfigOverrides, CanHibernateWebSocket};
+pub use config::{
+	ActionDefinition, ActorConfig, ActorConfigOverrides, ActorConsistency, CanHibernateWebSocket,
+};
 pub use connection::ConnHandle;
 pub use context::{ActorContext, ActorWorkRegion, KeepAwakeRegion, WebSocketCallbackRegion};
-pub use factory::{ActorEntryFn, ActorFactory};
+pub use factory::{ActorActionMode, ActorEntryFn, ActorFactory};
 pub use lifecycle_hooks::{ActorEvents, ActorStart, Reply};
 pub use messages::{
 	ActorEvent, QueueSendResult, QueueSendStatus, Request, Response, StateDelta, WorkflowKvWrite,
@@ -54,4 +57,10 @@ pub use task::{
 	LifecycleEvent, LifecycleState,
 };
 pub use task_types::{ActorChildOutcome, ShutdownKind, StateMutationReason, UserTaskKind};
+pub use transactional::{
+	PendingTransactionalEffect, TransactionalEffect, TransactionalOperation,
+	TransactionalOperationAdmission, TransactionalOperationFailure, TransactionalOperationKind,
+	TransactionalOperationRecord, TransactionalOperationRequest, TransactionalOperationStatus,
+	TransactionalScheduleUpsert,
+};
 pub use work_registry::{ActorWorkKind, ActorWorkPolicy};

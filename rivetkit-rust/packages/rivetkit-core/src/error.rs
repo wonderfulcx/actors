@@ -237,6 +237,52 @@ pub enum ActorRuntime {
 }
 
 #[derive(RivetError, Debug, Clone, Deserialize, Serialize)]
+#[error("actor")]
+pub enum TransactionalOperationError {
+	#[error(
+		"operation_id_conflict",
+		"Actor operation ID conflicts with an existing operation.",
+		"Actor operation ID '{operation_id}' was reused with different input."
+	)]
+	OperationIdConflict { operation_id: String },
+
+	#[error(
+		"operation_result_expired",
+		"Actor operation result has expired and the operation cannot execute again.",
+		"Actor operation '{operation_id}' result has expired and the operation cannot execute again."
+	)]
+	OperationResultExpired { operation_id: String },
+
+	#[error(
+		"operation_in_progress",
+		"Actor operation is already in progress.",
+		"Actor operation '{operation_id}' is already in progress."
+	)]
+	OperationInProgress { operation_id: String },
+
+	#[error(
+		"operation_interrupted",
+		"Actor operation was interrupted.",
+		"Actor operation '{operation_id}' was interrupted after execution started."
+	)]
+	OperationInterrupted { operation_id: String },
+
+	#[error(
+		"invalid_transactional_operation",
+		"Actor transactional operation is invalid.",
+		"Actor transactional operation is invalid: {reason}"
+	)]
+	InvalidOperation { reason: String },
+
+	#[error(
+		"transactional_runtime_required",
+		"Actor transactional runtime is not configured.",
+		"Actor consistency mode is transactional, but its runtime factory does not support transactional operations."
+	)]
+	RuntimeRequired,
+}
+
+#[derive(RivetError, Debug, Clone, Deserialize, Serialize)]
 #[error("protocol")]
 pub(crate) enum ProtocolError {
 	#[error(

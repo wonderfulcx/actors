@@ -82,11 +82,15 @@ impl WebSocket {
 		let send_sender = sender.clone();
 		let close_sender = sender;
 		self.configure_send_callback(Some(Arc::new(move |message| {
-			match message {
+			let sent = match message {
 				WsMessage::Text(text) => send_sender.send_text(&text),
 				WsMessage::Binary(bytes) => send_sender.send(bytes, true),
+			};
+			if sent {
+				Ok(())
+			} else {
+				Err(anyhow::anyhow!("websocket transport is closed"))
 			}
-			Ok(())
 		})));
 		self.configure_close_callback(Some(Arc::new(move |code, reason| {
 			let close_sender = close_sender.clone();

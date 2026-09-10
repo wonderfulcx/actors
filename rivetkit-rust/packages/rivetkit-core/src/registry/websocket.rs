@@ -2,6 +2,7 @@ use super::actor_connect::*;
 use super::dispatch::*;
 use super::inspector::encode_json_as_cbor;
 use super::*;
+use crate::ConnectionProtocol;
 use crate::error::ProtocolError;
 use crate::time::timeout;
 use tracing::Instrument;
@@ -546,6 +547,7 @@ impl RegistryDispatcher {
 					is_hibernatable,
 					hibernation,
 					Some(websocket_request.clone()),
+					ConnectionProtocol::RawWebSocket,
 					async { Ok(Vec::new()) },
 				)
 				.await?
@@ -718,25 +720,54 @@ fn configure_actor_connect_connection(
 	conn.configure_disconnect_handler(Some(managed_disconnect));
 
 	let event_sender = sender.clone();
-	conn.configure_event_sender(Some(Arc::new(
-		move |event| match send_actor_connect_message(
+	conn.configure_event_sender(Some(Arc::new(move |event| {
+		map_actor_connect_send_result(
 			&event_sender,
-			encoding,
-			&ActorConnectToClient::Event(ActorConnectEvent {
-				name: event.name,
-				args: ByteBuf::from(event.args),
-			}),
-			max_outgoing_message_size,
-		) {
-			Ok(()) => Ok(()),
-			Err(ActorConnectSendError::OutgoingTooLong) => {
-				event_sender.close(Some(1011), Some("message.outgoing_too_long".to_owned()));
-				Ok(())
-			}
-			Err(ActorConnectSendError::Encode(error)) => Err(error),
-		},
-	)));
+			send_actor_connect_message(
+				&event_sender,
+				encoding,
+				&ActorConnectToClient::Event(ActorConnectEvent {
+					name: event.name,
+					args: ByteBuf::from(event.args),
+				}),
+				max_outgoing_message_size,
+			),
+		)
+	})));
+	let admitted_sender = sender.clone();
+	conn.configure_event_sender_admitted(Some(Arc::new(move |event| {
+		let admitted_sender = admitted_sender.clone();
+		Box::pin(async move {
+			let result = send_actor_connect_message_admitted(
+				&admitted_sender,
+				encoding,
+				&ActorConnectToClient::Event(ActorConnectEvent {
+					name: event.name,
+					args: ByteBuf::from(event.args),
+				}),
+				max_outgoing_message_size,
+			)
+			.await;
+			map_actor_connect_send_result(&admitted_sender, result)
+		})
+	})));
 	Ok(())
+}
+
+fn map_actor_connect_send_result(
+	sender: &WebSocketSender,
+	result: std::result::Result<(), ActorConnectSendError>,
+) -> Result<()> {
+	match result {
+		Ok(()) => Ok(()),
+		Err(ActorConnectSendError::OutgoingTooLong) => {
+			sender.close(Some(1011), Some("message.outgoing_too_long".to_owned()));
+			Err(anyhow::anyhow!(
+				"actor connection event exceeds the outgoing message limit"
+			))
+		}
+		Err(ActorConnectSendError::Encode(error)) => Err(error),
+	}
 }
 
 pub(super) async fn persist_and_ack_hibernatable_actor_message(

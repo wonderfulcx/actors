@@ -385,6 +385,13 @@ pub struct QueueSendResult {
 	pub response: Option<Vec<u8>>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ConnectionProtocol {
+	ActorConnect,
+	Request,
+	RawWebSocket,
+}
+
 #[derive(Debug)]
 pub enum ActorEvent {
 	Action {
@@ -415,6 +422,7 @@ pub enum ActorEvent {
 	},
 	ConnectionPreflight {
 		conn: ConnHandle,
+		protocol: ConnectionProtocol,
 		params: Vec<u8>,
 		request: Option<Request>,
 		reply: Reply<()>,

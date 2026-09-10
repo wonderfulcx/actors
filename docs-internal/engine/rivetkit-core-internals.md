@@ -29,6 +29,12 @@ Runtime actor persistence lives in internal SQLite tables. The `_rivet_` table p
 | `_rivet_queue` | Queue messages |
 | `_rivet_wf_kv` | TypeScript workflow storage with verbatim packed keys |
 | `_rivet_user_kv` | Deprecated user `c.kv` compatibility storage |
+| `_rivet_operations` | Transactional operation durable starts, terminal outcomes, and idempotency records |
+| `_rivet_operation_effects` | Ordered effects buffered by successful transactional operations |
+| `_rivet_transactional_runtime` | Actor-local transactional commit sequence |
+
+See `docs-internal/engine/transactional-actor-consistency.md` for the opt-in
+transactional runtime contract.
 
 ## Legacy KV import
 
@@ -73,15 +79,18 @@ Legacy traces under `[7, 1, ...]` are intentionally skipped and are not copied t
 
 ## Startup sequence
 
-1. Ensure the internal SQLite schema and import legacy KV to SQLite if needed.
-2. Load actor startup data from internal SQLite into `ActorContext` before factory creation.
-3. Persist `has_initialized` immediately.
-4. Resync persisted alarms and restore hibernatable connections.
-5. Set `ready` before the driver hook.
-6. Reset the sleep timer.
-7. Spawn `run` in a detached panic-catching task.
-8. Drain overdue scheduled events after `started`.
-9. Set `started` after the driver hook completes.
+1. Ensure the internal SQLite schema. Transactional runtimes terminalize any
+   operation left `started` by a previous actor generation; started operations
+   are never replayed.
+2. Import legacy KV to SQLite if needed.
+3. Load actor startup data from internal SQLite into `ActorContext` before factory creation.
+4. Persist `has_initialized` immediately.
+5. Resync persisted alarms and restore hibernatable connections.
+6. Set `ready` before the driver hook.
+7. Reset the sleep timer.
+8. Spawn `run` in a detached panic-catching task.
+9. Drain overdue scheduled events after `started`.
+10. Set `started` after the driver hook completes.
 
 ## Shutdown sequences
 

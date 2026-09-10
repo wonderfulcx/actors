@@ -5,7 +5,7 @@
 //! SQLite backend; it does not reintroduce an unavailable or in-memory runtime
 //! backend.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
 use anyhow::Result;
@@ -24,6 +24,7 @@ use rusqlite::types::{Value, ValueRef};
 use tokio::sync::mpsc;
 
 use crate::ActorConfig;
+use crate::actor::connection::{ConnHandle, HibernatableConnectionMetadata};
 use crate::actor::context::ActorContext;
 use crate::actor::kv::LegacyActorKv;
 use crate::sqlite::SqliteDb;
@@ -107,6 +108,33 @@ pub fn actor_context(
 	region: impl Into<String>,
 ) -> ActorContext {
 	ActorContextHarness::new().context(actor_id, name, key, region)
+}
+
+/// Installs a live connection whose outgoing events are observable by a downstream test.
+pub fn add_connection(
+	ctx: &ActorContext,
+	connection_id: impl Into<String>,
+	is_hibernatable: bool,
+) -> (ConnHandle, mpsc::UnboundedReceiver<(String, Vec<u8>)>) {
+	let connection = ConnHandle::new(connection_id, Vec::new(), Vec::new(), is_hibernatable);
+	if is_hibernatable {
+		connection.configure_hibernation(Some(HibernatableConnectionMetadata {
+			gateway_id: [1, 2, 3, 4],
+			request_id: [5, 6, 7, 8],
+			server_message_index: 0,
+			client_message_index: 0,
+			request_path: "/test".to_owned(),
+			request_headers: BTreeMap::new(),
+		}));
+	}
+	let (event_tx, event_rx) = mpsc::unbounded_channel();
+	connection.configure_event_sender(Some(Arc::new(move |event| {
+		event_tx
+			.send((event.name, event.args))
+			.map_err(|_| anyhow::anyhow!("test connection receiver closed"))
+	})));
+	ctx.insert_existing(connection.clone());
+	(connection, event_rx)
 }
 
 struct IdleEnvoyCallbacks;
@@ -211,13 +239,19 @@ fn spawn_remote_sqlite(mut receiver: mpsc::UnboundedReceiver<ToEnvoyMessage>) {
 			.expect("test sqlite runtime should build");
 		runtime.block_on(async move {
 			while let Some(message) = receiver.recv().await {
-				let ToEnvoyMessage::RemoteSqliteRequest {
-					request,
-					expected_session: _,
-					response_tx,
-				} = message
-				else {
-					continue;
+				let (request, response_tx) = match message {
+					ToEnvoyMessage::SetAlarm { ack_tx, .. } => {
+						if let Some(ack_tx) = ack_tx {
+							let _ = ack_tx.send(Ok(()));
+						}
+						continue;
+					}
+					ToEnvoyMessage::RemoteSqliteRequest {
+						request,
+						expected_session: _,
+						response_tx,
+					} => (request, response_tx),
+					_ => continue,
 				};
 				let response = match request {
 					RemoteSqliteRequest::Execute(request) => {

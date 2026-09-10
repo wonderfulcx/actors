@@ -83,6 +83,7 @@ members = [
   "rivetkit-rust/packages/inspector-protocol",
   "rivetkit-rust/packages/rivetkit",
   "rivetkit-rust/packages/rivetkit-core",
+  "rivetkit-rust/packages/rivetkit-wasmtime",
   "rivetkit-rust/packages/shared-types",
   "rivetkit-typescript/packages/rivetkit-napi",
   "rivetkit-typescript/packages/rivetkit-wasm",
@@ -177,6 +178,8 @@ members = [
   tracing-slog = "0.2"
   vergen-gitcl = "1.0.0"
   reqwest-eventsource = "0.6.0"
+  wasmtime = "=45.0.0"
+  wasmtime-wasi = "=45.0.0"
 
     [workspace.dependencies.async-nats]
     package = "rivet-async-nats"

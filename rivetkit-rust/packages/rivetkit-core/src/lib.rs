@@ -123,18 +123,18 @@ pub use actor::{kv, sqlite};
 
 pub use actor::action::ActionDispatchError;
 pub use actor::config::{
-	ActionDefinition, ActorConfig, ActorConfigInput, ActorConfigOverrides, CanHibernateWebSocket,
-	SqliteProfilingConfig, SqliteProfilingConfigInput,
+	ActionDefinition, ActorConfig, ActorConfigInput, ActorConfigOverrides, ActorConsistency,
+	CanHibernateWebSocket, SqliteProfilingConfig, SqliteProfilingConfigInput,
 };
 pub use actor::connection::ConnHandle;
 pub use actor::context::{
 	ActorContext, ActorKv, ActorWorkRegion, KeepAwakeRegion, WebSocketCallbackRegion,
 };
-pub use actor::factory::{ActorEntryFn, ActorFactory};
+pub use actor::factory::{ActorActionMode, ActorEntryFn, ActorFactory};
 pub use actor::lifecycle_hooks::{ActorEvents, ActorStart, Reply};
 pub use actor::messages::{
-	ActorEvent, ActorHttpResponse, QueueSendResult, QueueSendStatus, Request, Response,
-	SerializeStateReason, StateDelta, StreamingResponse, WorkflowKvWrite,
+	ActorEvent, ActorHttpResponse, ConnectionProtocol, QueueSendResult, QueueSendStatus, Request,
+	Response, SerializeStateReason, StateDelta, StreamingResponse, WorkflowKvWrite,
 };
 pub use actor::queue::{
 	CompletableQueueMessage, EnqueueAndWaitOpts, QueueMessage, QueueNextBatchOpts, QueueNextOpts,
@@ -150,8 +150,14 @@ pub use actor::task::{
 	LifecycleEvent, LifecycleState,
 };
 pub use actor::task_types::ShutdownKind;
+pub use actor::transactional::{
+	PendingTransactionalEffect, TransactionalEffect, TransactionalOperation,
+	TransactionalOperationAdmission, TransactionalOperationFailure, TransactionalOperationKind,
+	TransactionalOperationRecord, TransactionalOperationRequest, TransactionalOperationStatus,
+	TransactionalScheduleUpsert,
+};
 pub use actor::work_registry::{ActorWorkKind, ActorWorkPolicy};
-pub use error::ActorLifecycle;
+pub use error::{ActorLifecycle, TransactionalOperationError};
 pub use inspector::{Inspector, InspectorSnapshot};
 pub use registry::{CoreRegistry, EngineSpawnMode, ServeConfig};
 pub use rivet_envoy_client::config::{

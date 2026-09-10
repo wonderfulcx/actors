@@ -60,6 +60,27 @@ mod moved_tests {
 	}
 
 	#[tokio::test]
+	async fn transactional_alarm_sync_failure_retries_while_actor_stays_awake() {
+		let ctx = context("transactional-alarm-retry");
+		ctx.fail_next_schedule_alarm_sync_for_tests();
+		ctx.finalize_transactional_schedule_change().await;
+		assert!(
+			ctx.0.schedule_alarm_retry_active.load(Ordering::SeqCst),
+			"failed synchronization must install a retry"
+		);
+		assert_eq!(ctx.keep_awake_count(), 1);
+
+		tokio::time::timeout(Duration::from_secs(1), async {
+			while ctx.0.schedule_alarm_retry_active.load(Ordering::SeqCst) {
+				tokio::time::sleep(Duration::from_millis(10)).await;
+			}
+		})
+		.await
+		.expect("successful alarm synchronization retry");
+		assert_eq!(ctx.keep_awake_count(), 0);
+	}
+
+	#[tokio::test]
 	async fn one_shot_crud_is_sqlite_backed() {
 		let harness = ActorContextHarness::new();
 		let ctx = harness.context("actor-one-shot", "actor", Vec::new(), "local");
@@ -293,20 +314,216 @@ mod moved_tests {
 		assert_eq!(dispatches.len(), 1);
 		assert_eq!(dispatches[0].event_id, event_id);
 		assert_eq!(dispatches[0].args, vec![7]);
+		assert!(
+			ctx.get_scheduled_event(&event_id).await.unwrap().is_some(),
+			"one-shot remains durable until its action replies"
+		);
+		ctx.finish_one_shot_schedule(&event_id, BASE_TIME, BASE_TIME)
+			.await;
+		ctx.finish_schedule_dispatch(&event_id, None, None).await;
 		assert!(ctx.get_scheduled_event(&event_id).await.unwrap().is_none());
 	}
 
 	#[tokio::test]
-	async fn due_one_shots_are_claimed_across_batch_boundaries() {
-		let ctx = context("actor-one-shot-claim-batches");
+	async fn due_one_shots_remain_durable_until_action_completion() {
+		let ctx = context("actor-one-shot-durable-claim");
 		for index in 0..129 {
 			ctx.at(BASE_TIME, "tick", &[index]).await.unwrap();
 		}
 
 		let dispatches = ctx.take_due_schedule_dispatches().await.unwrap();
 		assert_eq!(dispatches.len(), 129);
-		assert!(ctx.list_scheduled_events().await.unwrap().is_empty());
+		assert_eq!(ctx.list_scheduled_events().await.unwrap().len(), 129);
 		assert!(ctx.take_due_schedule_dispatches().await.unwrap().is_empty());
+		for dispatch in dispatches {
+			ctx.finish_one_shot_schedule(
+				&dispatch.event_id,
+				dispatch.fire.scheduled_at,
+				dispatch.fire.fired_at,
+			)
+			.await;
+			ctx.finish_schedule_dispatch(&dispatch.event_id, None, None)
+				.await;
+		}
+		assert!(ctx.list_scheduled_events().await.unwrap().is_empty());
+	}
+
+	async fn replace_one_shot(
+		ctx: &ActorContext,
+		event_id: &str,
+		trigger_at: i64,
+		action: &str,
+		args: &[u8],
+	) {
+		let tx = ctx.sql().begin_transaction(None).await.unwrap();
+		tx.execute(
+			UPSERT_NAMED_SCHEDULE_EVENT_SQL,
+			Some(vec![
+				BindParam::Text(event_id.to_owned()),
+				BindParam::Integer(trigger_at),
+				BindParam::Text(action.to_owned()),
+				BindParam::Blob(args.to_vec()),
+				BindParam::Integer(ScheduleKind::At.as_i64()),
+			]),
+		)
+		.await
+		.expect("stage one-shot replacement");
+		tx.commit().await.expect("commit one-shot replacement");
+	}
+
+	#[tokio::test]
+	async fn one_shot_claim_dispatches_replacement_committed_after_selection() {
+		for (action, args) in [("replacement", vec![2]), ("original", vec![])] {
+			let ctx = context("actor-one-shot-select-replace-claim");
+			let event_id = ctx.at(BASE_TIME, "original", &[1]).await.unwrap();
+			let mutation = ctx.0.schedule_mutation_lock.lock().await;
+			let selected = ctx
+				.sql()
+				.query(
+					TAKE_DUE_SCHEDULES_SQL,
+					Some(vec![BindParam::Integer(BASE_TIME)]),
+				)
+				.await
+				.unwrap();
+			let stale = read_stored_schedule(&selected.rows[0]).unwrap();
+			assert_eq!(stale.action, "original");
+			assert_eq!(stale.args, vec![1]);
+
+			// Transactional upserts can commit while the scheduler holds its mutation lock.
+			replace_one_shot(&ctx, &event_id, BASE_TIME, action, &args).await;
+			let dispatch = ctx
+				.claim_due_one_shot(stale, BASE_TIME)
+				.await
+				.unwrap()
+				.unwrap();
+			drop(mutation);
+			assert_eq!(
+				dispatch.action, action,
+				"claim must return the current action"
+			);
+			assert_eq!(dispatch.args, args, "claim must return the current args");
+			assert_eq!(dispatch.fire.scheduled_at, BASE_TIME);
+			assert_eq!(dispatch.fire.fired_at, BASE_TIME);
+			ctx.finish_one_shot_schedule(&event_id, BASE_TIME, BASE_TIME)
+				.await;
+			ctx.finish_schedule_dispatch(&event_id, None, None).await;
+			assert!(ctx.get_scheduled_event(&event_id).await.unwrap().is_none());
+		}
+	}
+
+	#[tokio::test]
+	async fn one_shot_claim_rechecks_selected_deadline_and_cancellation() {
+		for replacement_deadline in [Some(BASE_TIME - 1), Some(BASE_TIME + 1_000), None] {
+			let ctx = context("actor-one-shot-changed-before-claim");
+			let event_id = ctx.at(BASE_TIME, "original", &[1]).await.unwrap();
+			let mutation = ctx.0.schedule_mutation_lock.lock().await;
+			let selected = ctx
+				.sql()
+				.query(
+					TAKE_DUE_SCHEDULES_SQL,
+					Some(vec![BindParam::Integer(BASE_TIME)]),
+				)
+				.await
+				.unwrap();
+			let stale = read_stored_schedule(&selected.rows[0]).unwrap();
+			match replacement_deadline {
+				Some(deadline) => {
+					replace_one_shot(&ctx, &event_id, deadline, "replacement", &[2]).await
+				}
+				None => {
+					let tx = ctx.sql().begin_transaction(None).await.unwrap();
+					tx.execute(
+						CANCEL_SCHEDULE_SQL,
+						Some(vec![
+							BindParam::Text(event_id.clone()),
+							BindParam::Integer(ScheduleKind::At.as_i64()),
+						]),
+					)
+					.await
+					.unwrap();
+					tx.commit().await.unwrap();
+				}
+			}
+			assert!(
+				ctx.claim_due_one_shot(stale, BASE_TIME)
+					.await
+					.unwrap()
+					.is_none()
+			);
+			drop(mutation);
+			assert!(!ctx.0.schedule_running.contains_sync(&event_id));
+			if let Some(deadline) = replacement_deadline {
+				if deadline > BASE_TIME {
+					assert!(ctx.take_due_schedule_dispatches().await.unwrap().is_empty());
+				}
+				ctx.set_schedule_time_for_tests(BASE_TIME.max(deadline));
+				let dispatch = ctx
+					.take_due_schedule_dispatches()
+					.await
+					.unwrap()
+					.pop()
+					.unwrap();
+				assert_eq!(dispatch.action, "replacement");
+				assert_eq!(dispatch.args, vec![2]);
+				assert_eq!(dispatch.fire.scheduled_at, deadline);
+			}
+		}
+	}
+
+	#[tokio::test]
+	async fn one_shot_completion_preserves_replacement_including_same_deadline() {
+		for replacement_deadline in [BASE_TIME, BASE_TIME + 1_000] {
+			let ctx = context("actor-one-shot-replacement");
+			let event_id = ctx.at(BASE_TIME, "original", &[1]).await.unwrap();
+			let dispatch = ctx
+				.take_due_schedule_dispatches()
+				.await
+				.unwrap()
+				.pop()
+				.unwrap();
+
+			replace_one_shot(&ctx, &event_id, replacement_deadline, "replacement", &[2]).await;
+			assert_eq!(dispatch.action, "original");
+			assert_eq!(dispatch.args, vec![1]);
+			assert!(
+				ctx.take_due_schedule_dispatches().await.unwrap().is_empty(),
+				"replacement cannot be claimed before old completion"
+			);
+			ctx.finish_one_shot_schedule(
+				&event_id,
+				dispatch.fire.scheduled_at,
+				dispatch.fire.fired_at,
+			)
+			.await;
+			let replacement = ctx
+				.get_scheduled_event(&event_id)
+				.await
+				.unwrap()
+				.expect("replacement must survive old completion");
+			assert_eq!(replacement.action, "replacement");
+			assert_eq!(replacement.args, vec![2]);
+			assert_eq!(replacement.run_at, replacement_deadline);
+			assert!(
+				ctx.take_due_schedule_dispatches().await.unwrap().is_empty(),
+				"running guard remains held until dispatch cleanup"
+			);
+			ctx.finish_schedule_dispatch(&event_id, None, None).await;
+
+			// Equal-deadline replacements are reclaimed at the exact same wall-clock time.
+			ctx.set_schedule_time_for_tests(replacement_deadline);
+			let replacement_dispatch = ctx
+				.take_due_schedule_dispatches()
+				.await
+				.unwrap()
+				.pop()
+				.unwrap();
+			assert_eq!(replacement_dispatch.action, "replacement");
+			assert_eq!(replacement_dispatch.args, vec![2]);
+			ctx.finish_one_shot_schedule(&event_id, replacement_deadline, replacement_deadline)
+				.await;
+			ctx.finish_schedule_dispatch(&event_id, None, None).await;
+			assert!(ctx.get_scheduled_event(&event_id).await.unwrap().is_none());
+		}
 	}
 
 	#[tokio::test]
@@ -794,6 +1011,14 @@ mod moved_tests {
 		let schedules = ctx.take_due_schedule_dispatches().await.unwrap();
 		assert_eq!(schedules.len(), 1);
 		assert_eq!(ctx.run_wake_at(), Some(BASE_TIME + 10_000));
+		ctx.finish_one_shot_schedule(
+			&schedules[0].event_id,
+			schedules[0].fire.scheduled_at,
+			schedules[0].fire.fired_at,
+		)
+		.await;
+		ctx.finish_schedule_dispatch(&schedules[0].event_id, None, None)
+			.await;
 		ctx.wait_for_pending_alarm_writes().await;
 		assert_eq!(
 			crate::actor::internal_storage::load_last_pushed_alarm(ctx.sql())

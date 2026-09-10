@@ -148,7 +148,7 @@ pub enum ToEnvoyMessage {
 		actor_id: String,
 		generation: Option<u32>,
 		alarm_ts: Option<i64>,
-		ack_tx: Option<oneshot::Sender<()>>,
+		ack_tx: Option<oneshot::Sender<Result<(), String>>>,
 	},
 	HwsAck {
 		gateway_id: protocol::GatewayId,
@@ -501,13 +501,13 @@ async fn envoy_loop(
 					}
 					ToEnvoyMessage::SetAlarm { actor_id, generation, alarm_ts, ack_tx } => {
 						if let Some(entry) = ctx.get_actor(&actor_id, generation) {
-							if let Err(error) = entry.handle.send(ToActor::SetAlarm { alarm_ts, ack_tx }) {
-								if let ToActor::SetAlarm { ack_tx: Some(ack_tx), .. } = error.0 {
-									let _ = ack_tx.send(());
-								}
+							if let Err(error) = entry.handle.send(ToActor::SetAlarm { alarm_ts, ack_tx })
+								&& let ToActor::SetAlarm { ack_tx: Some(ack_tx), .. } = error.0
+							{
+								let _ = ack_tx.send(Err("actor alarm queue is closed".to_owned()));
 							}
 						} else if let Some(ack_tx) = ack_tx {
-							let _ = ack_tx.send(());
+							let _ = ack_tx.send(Err("actor is not registered with envoy".to_owned()));
 						}
 					}
 					ToEnvoyMessage::HwsAck { gateway_id, request_id, envoy_message_index } => {

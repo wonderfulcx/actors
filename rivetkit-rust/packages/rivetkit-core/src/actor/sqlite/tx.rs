@@ -107,6 +107,7 @@ pub(super) struct ActiveTransaction {
 pub(super) enum TransactionTerminalState {
 	Committed,
 	RolledBack,
+	StatementFailed,
 	Expired(Duration),
 	ConnectionLost,
 }
@@ -617,7 +618,22 @@ impl SqliteDb {
 		let db = self.clone();
 		let key = key.to_owned();
 		run_detached_transaction_task(
-			async move { db.finish_transaction_inner(&key, commit).await },
+			async move {
+				let result = db.finish_transaction_inner(&key, commit).await;
+				if !commit && result.is_err() {
+					let state = db.transaction_coordinator.state.lock().await;
+					// Statement errors already perform rollback. Let aggregate failure
+					// cleanup acknowledge it without dispatching SQL on a new transaction.
+					if !state.closed
+						&& matches!(
+							state.terminal.get(&key),
+							Some(TransactionTerminalState::StatementFailed)
+						) {
+						return Ok(());
+					}
+				}
+				result
+			},
 			"sqlite transaction finish task failed",
 		)
 		.await
@@ -848,6 +864,40 @@ impl SqliteDb {
 		if is_remote_connection_error(&error) {
 			self.release_transaction(key, TransactionTerminalState::ConnectionLost, false)
 				.await;
+		} else {
+			// SQLite can implicitly roll back the whole transaction on a statement
+			// error, including constraints and triggers. The shared backend API does
+			// not expose autocommit state, so even otherwise recoverable errors must
+			// abort here. Never let a caught error turn later aggregate writes into
+			// independent autocommits. The caller holds the operation lock throughout
+			// cleanup, including when its awaiting task is cancelled.
+			let session = {
+				let state = self.transaction_coordinator.state.lock().await;
+				state
+					.active
+					.as_ref()
+					.filter(|active| active.key == key)
+					.map(|active| active.remote_session)
+			};
+			if let Some(remote_session) = session {
+				let rollback = self
+					.execute_backend_in_session("ROLLBACK".to_owned(), None, remote_session)
+					.await;
+				let rollback_failed = rollback.as_ref().is_err_and(|error| {
+					!is_no_active_transaction_error(error) && !is_remote_connection_error(error)
+				});
+				self.release_transaction(
+					key,
+					TransactionTerminalState::StatementFailed,
+					rollback_failed,
+				)
+				.await;
+				if let Err(rollback) = rollback
+					&& rollback_failed
+				{
+					tracing::error!(%rollback, "sqlite rollback after statement error failed");
+				}
+			}
 		}
 		self.attach_actor(map_transaction_connection_error(error))
 	}
@@ -925,7 +975,8 @@ impl SqliteDb {
 					storage_transport: "proxy",
 					outcome: match terminal {
 						TransactionTerminalState::Committed => "success",
-						TransactionTerminalState::RolledBack => "rollback",
+						TransactionTerminalState::RolledBack
+						| TransactionTerminalState::StatementFailed => "rollback",
 						TransactionTerminalState::Expired(_) => "expired",
 						TransactionTerminalState::ConnectionLost => "connection_lost",
 					},
@@ -1351,7 +1402,7 @@ fn transaction_terminal_error(key: &str, terminal: TransactionTerminalState) -> 
 	match terminal {
 		TransactionTerminalState::Expired(timeout) => transaction_expired_owner_error(key, timeout),
 		TransactionTerminalState::Committed => transaction_terminal_state_error(key, "committed"),
-		TransactionTerminalState::RolledBack => {
+		TransactionTerminalState::RolledBack | TransactionTerminalState::StatementFailed => {
 			transaction_terminal_state_error(key, "rolled back")
 		}
 		TransactionTerminalState::ConnectionLost => transaction_connection_lost_error(),

@@ -1,0 +1,55 @@
+package wonderful:cells@0.1.0;
+
+interface host {
+  variant sql-value {
+    null-value,
+    integer(s64),
+    float(f64),
+    text(string),
+    blob(list<u8>),
+  }
+
+  record sql-execute-result {
+    columns: list<string>,
+    rows: list<list<sql-value>>,
+    changes: s64,
+    last-insert-row-id: option<s64>,
+  }
+
+  execute-sql: func(sql: string, params: list<sql-value>) -> result<sql-execute-result, string>;
+}
+
+interface guest {
+  record guest-error {
+    code: string,
+    message: string,
+  }
+
+  record effect {
+    kind: string,
+    payload: list<u8>,
+  }
+
+  record command-output {
+    state: list<u8>,
+    value: list<u8>,
+    effects: list<effect>,
+    destroyed: bool,
+  }
+
+  activate: func(
+    bundle: list<u8>,
+    manifest: list<u8>,
+    initial-state: list<u8>,
+    input: option<list<u8>>,
+  ) -> result<_, guest-error>;
+
+  invoke-command: func(name: string, input: list<u8>) -> result<command-output, guest-error>;
+
+  snapshot: func() -> list<u8>;
+}
+
+world cell {
+  import host;
+  export guest;
+}

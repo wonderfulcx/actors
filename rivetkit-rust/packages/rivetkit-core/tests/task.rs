@@ -658,20 +658,13 @@ pub(crate) mod moved_tests {
 				assert_eq!(actor_id, expected_actor_id);
 				assert_eq!(generation, expected_generation);
 				if let Some(ack_tx) = ack_tx {
-					let _ = ack_tx.send(());
+					let _ = ack_tx.send(Ok(()));
 				}
 				alarm_ts
 			}
 			Ok(_) => panic!("expected set_alarm envoy message"),
 			Err(error) => panic!("expected set_alarm envoy message, got {error:?}"),
 		}
-	}
-
-	fn assert_no_alarm(rx: &mut mpsc::UnboundedReceiver<ToEnvoyMessage>) {
-		assert!(matches!(
-			rx.try_recv(),
-			Err(mpsc::error::TryRecvError::Empty)
-		));
 	}
 
 	fn shutdown_ack_factory(config: ActorConfig) -> Arc<ActorFactory> {
@@ -2622,7 +2615,7 @@ pub(crate) mod moved_tests {
 	}
 
 	#[tokio::test]
-	async fn startup_skips_future_alarm_push_when_last_pushed_matches() {
+	async fn startup_resubmits_future_alarm_when_last_pushed_matches() {
 		let kv = new_in_memory();
 		let future_ts = 4_102_444_800_000;
 		let persisted = PersistedActor {
@@ -2667,7 +2660,10 @@ pub(crate) mod moved_tests {
 			.expect("start reply should send")
 			.expect("start should succeed");
 
-		assert_no_alarm(&mut rx);
+		assert_eq!(
+			recv_alarm_now(&mut rx, "actor-startup-skip-alarm", Some(11)),
+			Some(future_ts),
+		);
 	}
 
 	#[tokio::test]
@@ -2907,8 +2903,8 @@ pub(crate) mod moved_tests {
 			_ => panic!("expected second alarm message"),
 		};
 
-		second_ack.send(()).expect("ack latest alarm");
-		first_ack.send(()).expect("ack stale alarm");
+		second_ack.send(Ok(())).expect("ack latest alarm");
+		first_ack.send(Ok(())).expect("ack stale alarm");
 		ctx.wait_for_pending_alarm_writes().await;
 		assert_eq!(
 			crate::actor::internal_storage::load_last_pushed_alarm(ctx.sql())
@@ -2948,7 +2944,13 @@ pub(crate) mod moved_tests {
 			ActorEvent::Action { reply, .. } => reply.send(Ok(Vec::new())),
 			other => panic!("expected scheduled action dispatch, got {}", other.kind()),
 		}
-		assert!(ctx.list_scheduled_events().await.unwrap().is_empty());
+		tokio::time::timeout(Duration::from_secs(1), async {
+			while !ctx.list_scheduled_events().await.unwrap().is_empty() {
+				tokio::task::yield_now().await;
+			}
+		})
+		.await
+		.expect("one-shot completion should be persisted");
 	}
 
 	#[tokio::test]
@@ -4819,8 +4821,11 @@ pub(crate) mod moved_tests {
 
 		let (started_tx, started_rx) = oneshot::channel();
 		let started_tx = Arc::new(Mutex::new(Some(started_tx)));
+		let (closed_tx, closed_rx) = oneshot::channel();
+		let closed_tx = Arc::new(Mutex::new(Some(closed_tx)));
 		let factory = Arc::new(ActorFactory::new(Default::default(), move |start| {
 			let started_tx = started_tx.clone();
+			let closed_tx = closed_tx.clone();
 			Box::pin(async move {
 				let mut events = start.events;
 				started_tx
@@ -4853,6 +4858,15 @@ pub(crate) mod moved_tests {
 						| ActorEvent::ConnectionOpen { .. } => {
 							panic!("dead hibernated connection should not refire ConnectionOpen");
 						}
+						ActorEvent::ConnectionClosed { conn } => {
+							closed_tx
+								.lock()
+								.expect("closed sender lock poisoned")
+								.take()
+								.expect("closed sender should exist")
+								.send(conn.id().to_owned())
+								.expect("closed connection should send");
+						}
 						_ => {}
 					}
 				}
@@ -4883,6 +4897,10 @@ pub(crate) mod moved_tests {
 			Vec::<String>::new()
 		);
 		assert!(ctx.conns().is_empty());
+		assert_eq!(
+			closed_rx.await.expect("close callback should run"),
+			dead_conn.id()
+		);
 
 		task.handle_event(crate::actor::task::LifecycleEvent::SaveRequested { immediate: false })
 			.await;

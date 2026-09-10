@@ -1,0 +1,5 @@
+{
+  "code": "operation_in_progress",
+  "group": "actor",
+  "message": "Actor operation is already in progress."
+}

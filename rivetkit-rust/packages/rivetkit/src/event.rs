@@ -19,6 +19,7 @@ use serde::{
 
 use crate::{action, actor::Actor, context::ConnCtx, persist};
 
+#[cfg(test)]
 const EVENT_SET_TUPLE_ARITY_MAX: usize = 16;
 
 pub trait Event: Serialize + DeserializeOwned + Send + Sync + 'static {
@@ -139,6 +140,7 @@ impl<A: Actor> RuntimeEvent<A> {
 			}),
 			ActorEvent::ConnectionPreflight {
 				conn,
+				protocol: _,
 				params,
 				request,
 				reply,

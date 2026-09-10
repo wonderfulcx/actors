@@ -40,7 +40,9 @@ use crate::actor::diagnostics::ActorDiagnostics;
 use crate::actor::internal_storage;
 use crate::actor::kv::LegacyActorKv;
 use crate::actor::lifecycle_hooks::Reply;
-use crate::actor::messages::{ActorEvent, Request, StateDelta, WorkflowKvWrite};
+use crate::actor::messages::{
+	ActorEvent, ConnectionProtocol, Request, StateDelta, WorkflowKvWrite,
+};
 use crate::actor::metrics::ActorMetrics;
 use crate::actor::queue::{QueueInspectorUpdateCallback, QueueMetadata, QueueWaitActivityCallback};
 use crate::actor::schedule::{InternalKeepAwakeCallback, LocalAlarmCallback};
@@ -123,6 +125,7 @@ pub(crate) struct ActorContextInner {
 	pub(super) schedule_alarm_push_epoch: AtomicU64,
 	pub(super) schedule_alarm_dispatch_enabled: AtomicBool,
 	pub(super) schedule_dirty_since_push: AtomicBool,
+	pub(super) schedule_alarm_retry_active: AtomicBool,
 	pub(super) schedule_mutation_lock: AsyncMutex<()>,
 	pub(super) schedule_running: SccHashSet<String>,
 	pub(super) schedule_history_insert_count: AtomicUsize,
@@ -173,6 +176,7 @@ pub(crate) struct ActorContextInner {
 	pub(super) metrics: ActorMetrics,
 	diagnostics: ActorDiagnostics,
 	actor_id: String,
+	generation: RwLock<Option<u32>>,
 	name: String,
 	key: ActorKey,
 	region: String,
@@ -276,7 +280,7 @@ impl ActorContext {
 		name: String,
 		key: ActorKey,
 		region: String,
-		_generation: Option<u32>,
+		generation: Option<u32>,
 		_envoy_key: String,
 		config: ActorConfig,
 		legacy_kv: LegacyActorKv,
@@ -346,6 +350,7 @@ impl ActorContext {
 			// A fresh actor context has no in-process record of a successful
 			// envoy alarm push yet, so the first sync must always push.
 			schedule_dirty_since_push: AtomicBool::new(true),
+			schedule_alarm_retry_active: AtomicBool::new(false),
 			schedule_mutation_lock: AsyncMutex::new(()),
 			schedule_running: SccHashSet::new(),
 			schedule_history_insert_count: AtomicUsize::new(0),
@@ -388,6 +393,7 @@ impl ActorContext {
 			metrics,
 			diagnostics,
 			actor_id,
+			generation: RwLock::new(generation),
 			name,
 			key,
 			region,
@@ -551,6 +557,34 @@ impl ActorContext {
 		self.request_stop(None)
 	}
 
+	/// Establishes the local destruction admission fence without flushing replies
+	/// or submitting the engine intent. Transactional runtimes use this after the
+	/// destruction commit and must call [`Self::submit_fenced_destroy`] immediately
+	/// after sending the committed operation reply.
+	#[doc(hidden)]
+	pub fn fence_destroy(&self) -> Result<()> {
+		if self.0.destroy_requested.swap(true, Ordering::SeqCst) {
+			return Err(ActorLifecycleError::Stopping.build())
+				.context("destroy already requested for this generation");
+		}
+		self.cancel_sleep_timer();
+		self.0.destroy_completed.store(false, Ordering::SeqCst);
+		Ok(())
+	}
+
+	/// Flushes the generation and submits an engine intent after
+	/// [`Self::fence_destroy`] has established the admission fence.
+	#[doc(hidden)]
+	pub fn submit_fenced_destroy(&self) -> Result<()> {
+		if !self.0.destroy_requested.load(Ordering::SeqCst) {
+			return Err(ActorLifecycleError::NotReady.build())
+				.context("cannot submit destroy before establishing its fence");
+		}
+		self.mark_destroy_requested();
+		self.spawn_destroy_request();
+		Ok(())
+	}
+
 	/// Request a stop with an error attached. Behaves like [`Self::destroy`]
 	/// locally (destroy grace hooks run for this generation), but the envoy
 	/// reports the stop to the engine with `StopCode::Error` and the message,
@@ -590,6 +624,11 @@ impl ActorContext {
 		#[cfg(feature = "wasm-runtime")]
 		self.mark_destroy_requested_without_spawn();
 
+		self.spawn_destroy_request();
+		Ok(())
+	}
+
+	fn spawn_destroy_request(&self) {
 		let ctx = self.clone();
 		if Handle::try_current().is_ok() {
 			let tracked = self.track_shutdown_task(async move {
@@ -599,12 +638,11 @@ impl ActorContext {
 				ctx.record_user_task_finished(UserTaskKind::DestroyRequest, started_at.elapsed());
 			});
 			if tracked {
-				return Ok(());
+				return;
 			}
 		}
 
 		self.request_destroy_from_envoy();
-		Ok(())
 	}
 
 	pub fn mark_destroy_requested(&self) {
@@ -756,6 +794,15 @@ impl ActorContext {
 
 	pub fn actor_id(&self) -> &str {
 		&self.0.actor_id
+	}
+
+	/// Returns the active engine generation after this context is attached to an actor task.
+	pub fn generation(&self) -> Option<u32> {
+		*self.0.generation.read()
+	}
+
+	pub(crate) fn configure_generation(&self, generation: u32) {
+		*self.0.generation.write() = Some(generation);
 	}
 
 	pub fn name(&self) -> &str {
@@ -1003,13 +1050,21 @@ impl ActorContext {
 		is_hibernatable: bool,
 		hibernation: Option<HibernatableConnectionMetadata>,
 		request: Option<Request>,
+		protocol: ConnectionProtocol,
 		create_state: F,
 	) -> Result<ConnHandle>
 	where
 		F: Future<Output = Result<Vec<u8>>> + Send,
 	{
 		let conn = self
-			.connect_with_state(params, is_hibernatable, hibernation, request, create_state)
+			.connect_with_state(
+				params,
+				is_hibernatable,
+				hibernation,
+				request,
+				protocol,
+				create_state,
+			)
 			.await?;
 		self.record_connections_updated();
 		self.reset_sleep_timer();
@@ -1036,6 +1091,7 @@ impl ActorContext {
 				hibernation,
 				request,
 				create_state,
+				ConnectionProtocol::ActorConnect,
 				prepare_connection,
 			)
 			.await?;
@@ -1053,8 +1109,15 @@ impl ActorContext {
 	where
 		F: Future<Output = Result<Vec<u8>>> + Send,
 	{
-		self.connect_conn(params, false, None, request, create_state)
-			.await
+		self.connect_conn(
+			params,
+			false,
+			None,
+			request,
+			ConnectionProtocol::Request,
+			create_state,
+		)
+		.await
 	}
 
 	pub(crate) fn reconnect_hibernatable_conn(
@@ -1374,6 +1437,13 @@ impl ActorContext {
 		self.try_send_lifecycle_event(
 			LifecycleEvent::InspectorSerializeRequested,
 			"inspector_serialize_requested",
+		);
+	}
+
+	pub(crate) fn notify_transactional_dispatch_completed(&self) {
+		self.try_send_lifecycle_event(
+			LifecycleEvent::TransactionalDispatchCompleted,
+			"transactional_dispatch_completed",
 		);
 	}
 
@@ -1703,6 +1773,8 @@ impl ActorContext {
 		let args = dispatch.args;
 		let scheduled_fire = dispatch.fire;
 		let recurring_name = scheduled_fire.name.clone();
+		let one_shot_claim = (scheduled_fire.kind == crate::actor::schedule::ScheduleKind::At)
+			.then_some((scheduled_fire.scheduled_at, scheduled_fire.fired_at));
 		let history_id = dispatch.history_id;
 		let internal_keep_awake_region = self.begin_work_region(ActorWorkKind::InternalKeepAwake);
 
@@ -1714,6 +1786,7 @@ impl ActorContext {
 			let (reply_tx, reply_rx) = oneshot::channel();
 
 			let mut dispatch_error = None;
+			let mut action_replied = false;
 			match ctx.try_send_actor_event(
 				ActorEvent::Action {
 					name: action.clone(),
@@ -1725,8 +1798,9 @@ impl ActorContext {
 				"scheduled_action",
 			) {
 				Ok(()) => match reply_rx.await {
-					Ok(Ok(_)) => {}
+					Ok(Ok(_)) => action_replied = true,
 					Ok(Err(error)) => {
+						action_replied = true;
 						dispatch_error = Some(error);
 						tracing::error!(
 							error = ?dispatch_error.as_ref().expect("just assigned"),
@@ -1756,6 +1830,10 @@ impl ActorContext {
 				}
 			}
 
+			if action_replied && let Some((scheduled_at, claimed_at)) = one_shot_claim {
+				ctx.finish_one_shot_schedule(&event_id, scheduled_at, claimed_at)
+					.await;
+			}
 			ctx.finish_schedule_dispatch(&event_id, history_id, dispatch_error.as_ref())
 				.await;
 			if let (Some(name), Some(error)) = (recurring_name, dispatch_error.as_ref()) {

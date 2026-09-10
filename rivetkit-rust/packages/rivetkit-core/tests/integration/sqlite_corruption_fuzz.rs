@@ -603,6 +603,7 @@ fn sqlite_fuzz_factory() -> ActorFactory {
 					}
 					ActorEvent::ConnectionPreflight {
 						conn: _,
+						protocol: _,
 						params: _,
 						request: _,
 						reply,

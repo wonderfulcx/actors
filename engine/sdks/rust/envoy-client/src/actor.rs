@@ -36,7 +36,7 @@ pub enum ToActor {
 	Lost,
 	SetAlarm {
 		alarm_ts: Option<i64>,
-		ack_tx: Option<oneshot::Sender<()>>,
+		ack_tx: Option<oneshot::Sender<Result<(), String>>>,
 	},
 	ReqStart {
 		message_id: protocol::MessageId,
@@ -330,12 +330,13 @@ async fn actor_inner(
 						}
 					}
 					ToActor::SetAlarm { alarm_ts, ack_tx } => {
-						send_event(
+						let result = send_event_checked(
 							&mut ctx,
 							protocol::Event::EventActorSetAlarm(protocol::EventActorSetAlarm { alarm_ts }),
-						);
+						)
+						.map_err(|_| "envoy event queue is closed".to_owned());
 						if let Some(ack_tx) = ack_tx {
-							let _ = ack_tx.send(());
+							let _ = ack_tx.send(result);
 						}
 					}
 					ToActor::ReqStart { message_id, req, connection_session } => {
@@ -423,13 +424,20 @@ async fn actor_inner(
 }
 
 fn send_event(ctx: &mut ActorContext, inner: protocol::Event) {
+	let _ = send_event_checked(ctx, inner);
+}
+
+fn send_event_checked(
+	ctx: &mut ActorContext,
+	inner: protocol::Event,
+) -> Result<(), tokio::sync::mpsc::error::SendError<crate::envoy::ToEnvoyMessage>> {
 	let checkpoint = increment_checkpoint(ctx);
-	let _ = crate::envoy::send_to_envoy_tx(
+	crate::envoy::send_to_envoy_tx(
 		&ctx.shared,
 		crate::envoy::ToEnvoyMessage::SendEvents {
 			events: vec![protocol::EventWrapper { checkpoint, inner }],
 		},
-	);
+	)
 }
 
 async fn begin_stop(
@@ -565,8 +573,12 @@ fn spawn_ws_outgoing_task(
 		while let Some(msg) = outgoing_rx.recv().await {
 			idx += 1;
 			match msg {
-				WsOutgoing::Message { data, binary } => {
-					ws_send(
+				WsOutgoing::Message {
+					data,
+					binary,
+					admitted,
+				} => {
+					let failed = ws_send(
 						&shared,
 						protocol::ToRivet::ToRivetTunnelMessage(protocol::ToRivetTunnelMessage {
 							message_id: protocol::MessageId {
@@ -581,6 +593,9 @@ fn spawn_ws_outgoing_task(
 						}),
 					)
 					.await;
+					if let Some(admitted) = admitted {
+						let _ = admitted.send(!failed);
+					}
 				}
 				WsOutgoing::Flush { tx } => {
 					let _ = tx.send(());
@@ -1974,7 +1989,8 @@ mod tests {
 		tokio::time::timeout(Duration::from_secs(2), alarm_ack_rx)
 			.await
 			.expect("timed out waiting for alarm ack")
-			.expect("alarm ack sender dropped");
+			.expect("alarm ack sender dropped")
+			.expect("alarm submission failed");
 
 		assert!(stop_handle.complete(), "stop handle should complete once");
 		assert_alarm_before_stopped_event(&mut envoy_rx, Some(123)).await;

@@ -33,7 +33,6 @@ pub const MAX_HISTORY: i64 = 1_000;
 pub const MAX_ACTOR_HISTORY: i64 = 10_000;
 pub const MIN_INTERVAL_MS: i64 = 5_000;
 const DEFAULT_HISTORY_LIMIT: i64 = 20;
-const CLAIM_ONE_SHOT_BATCH_SIZE: usize = 128;
 pub(crate) const GLOBAL_HISTORY_PRUNE_INTERVAL: usize = 100;
 pub(crate) const GLOBAL_HISTORY_RETAINED_ROWS: i64 =
 	MAX_ACTOR_HISTORY - GLOBAL_HISTORY_PRUNE_INTERVAL as i64;
@@ -67,7 +66,7 @@ impl ScheduleKind {
 		}
 	}
 
-	fn as_i64(self) -> i64 {
+	pub(crate) fn as_i64(self) -> i64 {
 		match self {
 			Self::At => 0,
 			Self::Cron => 1,
@@ -549,7 +548,7 @@ impl ActorContext {
 			.transpose()
 	}
 
-	async fn ensure_schedule_capacity(&self, replacing_existing: bool) -> Result<()> {
+	pub(crate) async fn ensure_schedule_capacity(&self, replacing_existing: bool) -> Result<()> {
 		if replacing_existing {
 			return Ok(());
 		}
@@ -596,46 +595,12 @@ impl ActorContext {
 			.iter()
 			.map(|row| read_stored_schedule(row))
 			.collect::<Result<Vec<_>>>()?;
-		let claim_statements = due_schedules
-			.iter()
-			.filter(|event| event.kind == ScheduleKind::At)
-			.collect::<Vec<_>>()
-			.chunks(CLAIM_ONE_SHOT_BATCH_SIZE)
-			.map(|events| {
-				let mut params = Vec::with_capacity(events.len() * 2 + 1);
-				params.push(BindParam::Integer(ScheduleKind::At.as_i64()));
-				for event in events {
-					params.push(BindParam::Text(event.event_id.clone()));
-					params.push(BindParam::Integer(event.trigger_at));
-				}
-				SqliteBatchStatement {
-					sql: claim_one_shots_sql(events.len()),
-					params: Some(params),
-				}
-			})
-			.collect::<Vec<_>>();
-		if !claim_statements.is_empty() {
-			self.sql()
-				.execute_batch(claim_statements)
-				.await
-				.context("claim due one-shot schedules")?;
-		}
 		let mut dispatches = Vec::new();
 		for event in due_schedules {
 			if event.kind == ScheduleKind::At {
-				dispatches.push(DueScheduleDispatch {
-					event_id: event.event_id.clone(),
-					action: event.action,
-					args: event.args,
-					fire: ScheduledFireInfo {
-						kind: ScheduleKind::At,
-						id: event.event_id,
-						name: None,
-						scheduled_at: event.trigger_at,
-						fired_at: now_ms,
-					},
-					history_id: None,
-				});
+				if let Some(dispatch) = self.claim_due_one_shot(event, now_ms).await? {
+					dispatches.push(dispatch);
+				}
 				continue;
 			}
 
@@ -718,6 +683,100 @@ impl ActorContext {
 		// best effort so a transient sync failure cannot discard valid dispatches.
 		self.sync_alarm_logged().await;
 		Ok(dispatches)
+	}
+
+	// The caller holds schedule_mutation_lock, but transactional upserts do not.
+	// Claim the current payload at the selected deadline. A changed deadline or
+	// kind is left for the next drain instead of dispatching the stale selection.
+	async fn claim_due_one_shot(
+		&self,
+		event: StoredSchedule,
+		now_ms: i64,
+	) -> Result<Option<DueScheduleDispatch>> {
+		if self
+			.0
+			.schedule_running
+			.insert_sync(event.event_id.clone())
+			.is_err()
+		{
+			return Ok(None);
+		}
+		let claim = self
+			.sql()
+			.execute(
+				CLAIM_ONE_SHOT_SCHEDULE_SQL,
+				Some(vec![
+					BindParam::Integer(now_ms),
+					BindParam::Text(event.event_id.clone()),
+					BindParam::Integer(ScheduleKind::At.as_i64()),
+					BindParam::Integer(event.trigger_at),
+				]),
+			)
+			.await
+			.and_then(|result| {
+				result
+					.rows
+					.first()
+					.map(|row| read_stored_schedule(row))
+					.transpose()
+			});
+		let event = match claim {
+			Ok(Some(claimed)) => claimed,
+			Ok(None) => {
+				self.0.schedule_running.remove_sync(&event.event_id);
+				return Ok(None);
+			}
+			Err(error) => {
+				self.0.schedule_running.remove_sync(&event.event_id);
+				return Err(error).context("claim due one-shot schedule");
+			}
+		};
+		Ok(Some(DueScheduleDispatch {
+			event_id: event.event_id.clone(),
+			action: event.action,
+			args: event.args,
+			fire: ScheduledFireInfo {
+				kind: ScheduleKind::At,
+				id: event.event_id,
+				name: None,
+				scheduled_at: event.trigger_at,
+				fired_at: now_ms,
+			},
+			history_id: None,
+		}))
+	}
+
+	pub(crate) async fn finish_one_shot_schedule(
+		&self,
+		event_id: &str,
+		scheduled_at: i64,
+		claimed_at: i64,
+	) {
+		let _mutation = self.0.schedule_mutation_lock.lock().await;
+		// Upserts clear last_started_at. Keep schedule_running until this delete
+		// finishes so a replacement cannot be reclaimed with the same millisecond
+		// timestamp before the old completion, even when the deadline is unchanged.
+		match self
+			.sql()
+			.execute(
+				COMPLETE_ONE_SHOT_SCHEDULE_SQL,
+				Some(vec![
+					BindParam::Text(event_id.to_owned()),
+					BindParam::Integer(ScheduleKind::At.as_i64()),
+					BindParam::Integer(scheduled_at),
+					BindParam::Integer(claimed_at),
+				]),
+			)
+			.await
+		{
+			Ok(result) if result.changes > 0 => self.record_schedules_updated(),
+			Ok(_) => {}
+			Err(error) => {
+				tracing::error!(?error, event_id, "failed to complete one-shot schedule");
+			}
+		}
+		self.mark_schedule_dirty();
+		self.sync_alarm_logged().await;
 	}
 
 	pub(crate) async fn finish_schedule_dispatch(
@@ -906,6 +965,11 @@ impl ActorContext {
 		self.sync_alarm_timestamp(next_alarm)
 	}
 
+	pub(crate) fn force_schedule_alarm_resync(&self) {
+		self.load_last_pushed_alarm(None);
+		self.mark_schedule_dirty();
+	}
+
 	fn sync_alarm_timestamp(&self, next_alarm: Option<i64>) -> Result<()> {
 		let should_push = self
 			.0
@@ -931,10 +995,97 @@ impl ActorContext {
 		Ok(())
 	}
 
+	async fn sync_alarm_checked(&self) -> Result<()> {
+		#[cfg(test)]
+		if self
+			.0
+			.schedule_sync_alarm_failures
+			.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
+				remaining.checked_sub(1)
+			})
+			.is_ok()
+		{
+			anyhow::bail!("injected schedule alarm sync failure");
+		}
+		let next_alarm = min_deadline(
+			self.next_schedule_timestamp(false).await?,
+			self.run_wake_at(),
+		);
+		self.arm_local_alarm(next_alarm);
+		let envoy_handle = self
+			.0
+			.schedule_envoy_handle
+			.lock()
+			.clone()
+			.context("schedule alarm envoy handle is not configured")?;
+		let generation = *self.0.schedule_generation.lock();
+		let (ack_tx, ack_rx) = oneshot::channel();
+		envoy_handle.set_alarm_with_ack(
+			self.actor_id().to_owned(),
+			next_alarm,
+			generation,
+			Some(ack_tx),
+		);
+		ack_rx
+			.await
+			.context("receive scheduled actor alarm acknowledgement")?
+			.map_err(anyhow::Error::msg)?;
+		self.load_last_pushed_alarm(next_alarm);
+		self.persist_last_pushed_alarm(next_alarm).await?;
+		self.0
+			.schedule_dirty_since_push
+			.store(false, Ordering::SeqCst);
+		Ok(())
+	}
+
+	pub(crate) async fn finalize_transactional_schedule_change(&self) {
+		self.mark_schedule_dirty();
+		self.record_schedules_updated();
+		if let Err(error) = self.sync_alarm_checked().await {
+			self.mark_schedule_dirty();
+			tracing::error!(actor_id = %self.actor_id(), ?error, "failed to sync transactional actor alarm; retrying");
+			self.start_schedule_alarm_retry();
+		}
+	}
+
 	pub(crate) async fn sync_alarm_logged(&self) {
 		if let Err(error) = self.sync_alarm().await {
 			tracing::error!(actor_id = %self.actor_id(), ?error, "failed to sync scheduled actor alarm");
 		}
+	}
+
+	fn start_schedule_alarm_retry(&self) {
+		if self
+			.0
+			.schedule_alarm_retry_active
+			.compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+			.is_err()
+		{
+			return;
+		}
+		let ctx = self.clone();
+		let keep_awake = self.keep_awake_region();
+		self.register_task(async move {
+			let _keep_awake = keep_awake;
+			loop {
+				sleep(Duration::from_millis(100)).await;
+				let mutation = ctx.0.schedule_mutation_lock.lock().await;
+				match ctx.sync_alarm_checked().await {
+					Ok(()) if !ctx.0.schedule_dirty_since_push.load(Ordering::SeqCst) => {
+						ctx.0
+							.schedule_alarm_retry_active
+							.store(false, Ordering::SeqCst);
+						drop(mutation);
+						return;
+					}
+					Ok(()) => {}
+					Err(error) => {
+						ctx.mark_schedule_dirty();
+						tracing::error!(actor_id = %ctx.actor_id(), ?error, "scheduled actor alarm retry failed");
+					}
+				}
+			}
+		});
 	}
 
 	pub(crate) async fn sync_future_alarm_logged(&self) {
@@ -1042,17 +1193,33 @@ impl ActorContext {
 			let (persist_done_tx, persist_done_rx) = oneshot::channel();
 			handle.spawn(
 				async move {
-					let _ = ack_rx.await;
-					let is_current = state_ctx.0.schedule_alarm_push_epoch.load(Ordering::SeqCst)
-						== push_epoch && state_ctx.last_pushed_alarm() == timestamp_ms;
-					if is_current
-						&& let Err(error) = state_ctx.persist_last_pushed_alarm(timestamp_ms).await
-					{
-						tracing::error!(
-							?error,
-							?timestamp_ms,
-							"failed to persist last pushed actor alarm"
-						);
+					match ack_rx.await {
+						Ok(Ok(())) => {
+							let is_current =
+								state_ctx.0.schedule_alarm_push_epoch.load(Ordering::SeqCst)
+									== push_epoch;
+							if is_current {
+								state_ctx.load_last_pushed_alarm(timestamp_ms);
+								if let Err(error) =
+									state_ctx.persist_last_pushed_alarm(timestamp_ms).await
+								{
+									state_ctx.mark_schedule_dirty();
+									tracing::error!(
+										?error,
+										?timestamp_ms,
+										"failed to persist last pushed actor alarm"
+									);
+								}
+							}
+						}
+						Ok(Err(error)) => {
+							state_ctx.mark_schedule_dirty();
+							tracing::error!(%error, ?timestamp_ms, "failed to submit actor alarm");
+						}
+						Err(error) => {
+							state_ctx.mark_schedule_dirty();
+							tracing::error!(%error, ?timestamp_ms, "actor alarm acknowledgement dropped");
+						}
 					}
 					let _ = persist_done_tx.send(());
 				}
@@ -1062,9 +1229,7 @@ impl ActorContext {
 				.schedule_pending_alarm_writes
 				.lock()
 				.push(persist_done_rx);
-			return;
 		}
-		self.0.schedule_pending_alarm_writes.lock().push(ack_rx);
 	}
 
 	fn arm_local_alarm(&self, next_alarm: Option<i64>) {

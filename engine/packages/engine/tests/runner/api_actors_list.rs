@@ -347,7 +347,7 @@ fn list_with_include_destroyed_false() {
 		common::api::public::actors_delete(
 			ctx.leader_dc().guard_port(),
 			common::api_types::actors::delete::DeletePath {
-				actor_id: destroyed_actor_id,
+				actor_id: destroyed_actor_id.clone(),
 			},
 			common::api_types::actors::delete::DeleteQuery {
 				namespace: namespace.clone(),
@@ -394,6 +394,26 @@ fn list_with_include_destroyed_false() {
 
 		assert_eq!(response.actors.len(), 1, "Should only return active actor");
 		assert_eq!(response.actors[0].actor_id.to_string(), active_actor_id);
+
+		let by_id_response = common::api::public::actors_list(
+			ctx.leader_dc().guard_port(),
+			common::api_types::actors::list::ListQuery {
+				namespace,
+				name: None,
+				key: None,
+				actor_ids: None,
+				actor_id: vec![destroyed_actor_id],
+				include_destroyed: Some(false),
+				limit: None,
+				cursor: None,
+			},
+		)
+		.await
+		.expect("failed to list destroyed actor by ID");
+		assert!(
+			by_id_response.actors.is_empty(),
+			"destroyed actors must be filtered from actor-ID lookups by default"
+		);
 	});
 }
 

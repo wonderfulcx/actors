@@ -1,0 +1,36 @@
+type SocketSendEffect struct {
+	connection_id: str
+	payload: data
+}
+
+type SocketBroadcastEffect struct {
+	payload: data
+	exclude_connection_ids: list<str>
+}
+
+type SocketCloseEffect struct {
+	connection_id: str
+	reason: optional<str>
+}
+
+type SocketStateEffect struct {
+	connection_id: str
+	state: data
+}
+
+type ScheduleAtEffect struct {
+	schedule_id: str
+	timestamp_ms: i64
+	method: str
+	input: data
+}
+
+type ScheduleCancelEffect struct {
+	schedule_id: str
+}
+
+type SocketDeliveryEnvelope struct {
+	operation_id: str
+	effect_index: u32
+	payload: data
+}

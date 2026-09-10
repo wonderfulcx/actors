@@ -1283,6 +1283,45 @@ async fn failed_commit_accepts_sqlite_auto_rollback_as_cleanup_success() {
 }
 
 #[tokio::test]
+async fn statement_error_cleanup_failure_closes_the_coordinator() {
+	let (handle, mut envoy_rx) = test_envoy_handle();
+	let db = SqliteDb::new_with_remote_sqlite(handle, "actor-a", None, Some(7), true, true)
+		.expect("test remote sqlite should be configured");
+	let begin = tokio::spawn({
+		let db = db.clone();
+		async move { db.begin_transaction(None).await }
+	});
+	respond_to_execute(&mut envoy_rx, "BEGIN").await;
+	let transaction = begin.await.unwrap().unwrap();
+	let statement = tokio::spawn({
+		let transaction = transaction.clone();
+		async move { transaction.execute("statement", None).await }
+	});
+	receive_execute(&mut envoy_rx, "statement")
+		.await
+		.send(Err(anyhow::anyhow!("original statement error")))
+		.unwrap();
+	receive_execute(&mut envoy_rx, "ROLLBACK")
+		.await
+		.send(Err(anyhow::anyhow!("rollback unavailable")))
+		.unwrap();
+	assert!(
+		format!("{:#}", statement.await.unwrap().unwrap_err()).contains("original statement error")
+	);
+	for error in [
+		transaction.commit().await.unwrap_err(),
+		transaction.rollback().await.unwrap_err(),
+		db.execute("must-not-run", None).await.unwrap_err(),
+	] {
+		assert!(
+			error
+				.downcast_ref::<TransactionCoordinatorClosedError>()
+				.is_some()
+		);
+	}
+}
+
+#[tokio::test]
 async fn failed_rollback_closes_the_coordinator() {
 	let (handle, mut envoy_rx) = test_envoy_handle();
 	let db = SqliteDb::new_with_remote_sqlite(handle, "actor-a", None, Some(7), true, true)

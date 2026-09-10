@@ -55,6 +55,13 @@ pub struct ActionDefinition {
 	pub name: String,
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum ActorConsistency {
+	#[default]
+	Concurrent,
+	Transactional,
+}
+
 /// Experimental SQLite profiling configuration.
 ///
 /// This entire configuration surface, including every field, is subject to
@@ -159,6 +166,7 @@ pub struct ActorConfig {
 	pub has_state: bool,
 	pub can_hibernate_websocket: CanHibernateWebSocket,
 	pub state_save_interval: Duration,
+	pub consistency: ActorConsistency,
 	pub create_vars_timeout: Duration,
 	pub create_conn_state_timeout: Duration,
 	pub on_before_connect_timeout: Duration,
@@ -195,6 +203,7 @@ pub struct ActorConfigInput {
 	pub has_state: Option<bool>,
 	pub can_hibernate_websocket: Option<bool>,
 	pub state_save_interval_ms: Option<u32>,
+	pub transactional: Option<bool>,
 	pub create_vars_timeout_ms: Option<u32>,
 	pub create_conn_state_timeout_ms: Option<u32>,
 	pub on_before_connect_timeout_ms: Option<u32>,
@@ -233,6 +242,9 @@ impl ActorConfig {
 		if let Some(can_hibernate_websocket) = config.can_hibernate_websocket {
 			actor_config.can_hibernate_websocket =
 				CanHibernateWebSocket::Bool(can_hibernate_websocket);
+		}
+		if config.transactional.unwrap_or(false) {
+			actor_config.consistency = ActorConsistency::Transactional;
 		}
 		if let Some(value) = config.state_save_interval_ms {
 			actor_config.state_save_interval = duration_ms(value);
@@ -345,6 +357,7 @@ impl Default for ActorConfig {
 			has_state: false,
 			can_hibernate_websocket: CanHibernateWebSocket::default(),
 			state_save_interval: DEFAULT_STATE_SAVE_INTERVAL,
+			consistency: ActorConsistency::Concurrent,
 			create_vars_timeout: DEFAULT_CREATE_VARS_TIMEOUT,
 			create_conn_state_timeout: DEFAULT_CREATE_CONN_STATE_TIMEOUT,
 			on_before_connect_timeout: DEFAULT_ON_BEFORE_CONNECT_TIMEOUT,

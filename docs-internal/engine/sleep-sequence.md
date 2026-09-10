@@ -26,14 +26,27 @@ Two user-facing primitives in TypeScript. Both accept a `Promise`, never a closu
 
 Kept separate for debug visibility. Grace deadline warn logs report each counter independently so diagnostics distinguish user keep-awake sites from framework-owned keep-awake sites (schedule alarms, queue receives).
 
+A failed transactional schedule-alarm synchronization installs one registered retry
+task holding a scoped keep-awake region. It releases the region only after envoy
+acknowledges alarm admission and the acknowledged deadline is persisted; destroy's
+shutdown deadline can still abort the registered retry.
+
 ## Sleep readiness predicates
 
 Two predicates govern the sleep state machine. Both live on `ActorContext` / `SleepState`.
 
-- `can_arm_sleep_timer()` — the idle predicate. Returns `CanSleep::Yes` only when every sleep-affecting counter is zero and the run handler is inactive (or waiting on a queue). Used to start the sleep idle timer.
+- `can_arm_sleep_timer()` — the idle predicate. Returns `CanSleep::Yes` only when every sleep-affecting counter is zero and the run handler is inactive (or waiting on a queue). Non-hibernatable connections block it; hibernatable WebSocket transports do not pin the actor resident. Used to start the sleep idle timer.
 - `can_finalize_sleep()` — the grace predicate. Returns `true` only when every shutdown-affecting counter is zero: `core_dispatched_hooks`, `shutdown_task_count`, `sleep_keep_awake`, `sleep_internal_keep_awake`, `active_http_requests`, `websocket_callbacks`, `pending_disconnects`. Used to advance from `SleepGrace` to `SleepFinalize` (or finalize destroy).
 
 Removing `preventSleep` deleted both predicate branches. Any future sleep-affecting counter must add an entry in each predicate and must call `ActorContext::reset_sleep_timer()` on transitions that change the result.
+
+Transactional action execution is tracked as `ActorWorkKind::Action`, so it
+blocks both idle sleep and grace finalization until the runtime has durably
+committed or rolled back and replied. A transactional runtime must not reply
+while its operation transaction is still open. The Wonderful Cells effect pump
+holds an internal keep-awake region while committed effects are pending or retrying,
+then releases it as soon as the ordered queue is empty. Effect delivery never drops
+an in-flight actor-local transaction during graceful cleanup.
 
 ## Grace period and abort signals
 
@@ -52,6 +65,7 @@ When the grace deadline elapses before `can_finalize_sleep()` returns true:
 ## Guarding lifecycle requests
 
 - `ctx.sleep()` and `ctx.destroy()` return `Result<()>`. They fail with `actor/starting` if called before startup completes and `actor/stopping` if the request flag has already been swapped to true for this generation. An atomic `swap(true, ...)` on `sleep_requested` / `destroy_requested` enforces single-shot request semantics per generation.
+- Transactional runtimes may use the hidden two-phase destruction API: establish the local admission fence after the aggregate commit, send the committed reply, then flush and submit the engine intent. Wonderful Cells keeps the durable destroy effect pending because fire-and-forget intent submission is not an engine acknowledgement.
 - The idle sleep timer request path (`spawn_sleep_timer_task`) and the `ActorTask` sleep-tick path both suppress the already-requested error: idle-driven requests may race user-driven requests and the warning is informational.
 
 ## Serialize-state shutdown cap
