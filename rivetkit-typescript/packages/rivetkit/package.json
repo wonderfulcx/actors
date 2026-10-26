@@ -222,7 +222,7 @@
 		"@rivetkit/workflow-engine": "workspace:*",
 		"cbor-x": "^1.6.0",
 		"drizzle-orm": "catalog:",
-		"hono": "^4.7.0",
+		"hono": "^4.13.11",
 		"invariant": "^2.2.4",
 		"p-retry": "^6.2.1",
 		"pino": "^9.5.0",

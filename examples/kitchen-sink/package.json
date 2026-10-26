@@ -33,7 +33,7 @@
 		"drizzle-kit": "^0.31.2",
 		"tsx": "^4.20.6",
 		"typescript": "^5.5.2",
-		"vite": "^5.0.0"
+		"vite": "^6.4.4"
 	},
 	"dependencies": {
 		"@ai-sdk/openai": "^0.0.66",
@@ -45,7 +45,7 @@
 		"@rivetkit/rivetkit-napi": "workspace:*",
 		"ai": "^4.0.38",
 		"fdb-tuple": "^1.0.0",
-		"hono": "^4.11.3",
+		"hono": "^4.13.11",
 		"lucide-react": "^0.439.0",
 		"mermaid": "^11.12.2",
 		"prism-react-renderer": "^2.4.1",
