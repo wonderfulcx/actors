@@ -17,7 +17,7 @@
 	},
 	"dependencies": {
 		"@rivetkit/cloudflare-workers": "*",
-		"hono": "^4.8.3",
+		"hono": "^4.13.11",
 		"rivetkit": "*"
 	},
 	"stableVersion": "0.8.0",
