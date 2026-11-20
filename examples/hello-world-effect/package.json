@@ -12,7 +12,7 @@
 	"dependencies": {
 		"@effect/platform-node": "4.0.0-beta.66",
 		"@rivetkit/effect": "workspace:*",
-		"effect": "4.0.0-beta.66",
+		"effect": "4.0.0-beta.103",
 		"pino": "9.9.5",
 		"pino-pretty": "13.1.2",
 		"rivetkit": "workspace:*"
